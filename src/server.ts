@@ -794,7 +794,7 @@ registerCtxTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Process large or unpredictable command/API output in a sandbox. Filter, parse, compare, or summarize in code; only printed output enters context.",
+    description: "Run code in a sandbox to process large or unpredictable output. Print only the findings that should enter context; use ctx_batch_execute for multiple related commands.",
     inputSchema: z.object({
       language: z
         .enum([
@@ -1146,7 +1146,7 @@ registerCtxTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Process a file through FILE_CONTENT without loading the file into context. Use for large or structured file analysis.",
+    description: "Analyze a file without loading it into context. Code receives the file as FILE_CONTENT; only printed output is returned.",
     inputSchema: z.object({
       path: z
         .string()
@@ -1317,12 +1317,12 @@ registerCtxTool(
         .string()
         .optional()
         .describe(
-          "Raw text/markdown to index. Provide this OR path, not both.",
+          "Small inline text/markdown to index. Use path for files, directories, or large content saved to disk; provide content OR path, not both.",
         ),
       path: z
         .string()
         .optional()
-        .describe("File or directory path to index; provide this or content."),
+        .describe("File or directory path to index; preferred for files, directories, or large content saved to disk. Provide path OR content, not both."),
       source: z
         .string()
         .optional()
@@ -2644,7 +2644,7 @@ registerCtxTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Run related commands in one call, index their full output, and optionally return query matches. Use for related or large-output commands.",
+    description: "Run related commands in one call, index their full output, and return query matches. Use for related or large-output commands.",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
