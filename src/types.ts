@@ -23,9 +23,3 @@ export interface SearchResult {
   highlighted?: string;
   timestamp?: string;
 }
-
-export interface StoreStats {
-  sources: number;
-  chunks: number;
-  codeChunks: number;
-}

@@ -29,23 +29,58 @@ describe("1MCP tool surface", () => {
     expect(schema.safeParse({ language: "ruby", code: "" }).success).toBe(false);
   });
 
-  test("uses the configured project root for deny policies", async () => {
-    const root = mkdtempSync(join(tmpdir(), "context-mode-policy-"));
+  test("ctx_index requires exactly one of content or path", () => {
+    const index = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_index");
+    const schema = index?.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(schema.safeParse({ content: "inline" }).success).toBe(true);
+    expect(schema.safeParse({ path: "README.md" }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+    expect(schema.safeParse({ content: "inline", path: "README.md" }).success).toBe(false);
+  });
+
+  test("ctx_index blocks paths outside the configured project root", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "context-mode-outside-"));
     try {
-      mkdirSync(join(root, ".claude"));
-      writeFileSync(
-        join(root, ".claude", "settings.json"),
-        JSON.stringify({ permissions: { deny: ["Bash(sudo *)"] } }),
-      );
-      const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
-      expect(execute).toBeDefined();
+      const outsidePath = join(outside, "outside.txt");
+      writeFileSync(outsidePath, "outside marker");
+      const index = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_index");
+      expect(index).toBeDefined();
       const result = await withProjectDirOverride(root, () =>
-        execute!.handler({ language: "shell", code: "sudo echo blocked" }),
+        index!.handler({ path: outsidePath, source: "outside" }),
       ) as { isError?: boolean; content: Array<{ type: string; text: string }> };
       expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).toContain("blocked by security policy");
+      expect(result.content[0]?.text).toContain("outside the project root");
     } finally {
       rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("ctx_index honors project Read deny rules", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-deny-"));
+    try {
+      mkdirSync(join(root, ".claude"));
+      writeFileSync(join(root, "blocked.txt"), "blocked marker");
+      writeFileSync(
+        join(root, ".claude", "settings.json"),
+        JSON.stringify({ permissions: { deny: ["Read(blocked.txt)"] } }),
+      );
+      const index = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_index");
+      const result = await withProjectDirOverride(root, () =>
+        index!.handler({ path: "blocked.txt", source: "blocked" }),
+      ) as { isError?: boolean; content: Array<{ type: string; text: string }> };
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain("Read deny pattern");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("execution tools disclose that code uses the MCP server OS permissions", () => {
+    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute"]) {
+      const tool = REGISTERED_CTX_TOOLS.find((candidate) => candidate.name === name);
+      expect(tool?.config.description).toContain("OS permissions");
     }
   });
 

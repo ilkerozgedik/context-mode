@@ -42,15 +42,6 @@ export function buildScriptFilename(
   return `script.${SCRIPT_EXT[language]}`;
 }
 
-/**
- * Pure helper — exported for unit testing. Adds `windowsHide: true` on Windows
- * to prevent the spawned shell from creating a visible console window that
- * intercepts stdout (issue #384).
- */
-export function buildSpawnOptions(platform: NodeJS.Platform): { windowsHide: boolean } {
-  return { windowsHide: platform === "win32" };
-}
-
 function quoteForPosixShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -358,7 +349,7 @@ export class PolyglotExecutor {
         stdio: ["ignore", "pipe", "pipe"],
         env: this.#buildSafeEnv(sandboxTmpDir),
         detached: !isWin,
-        ...buildSpawnOptions(process.platform),
+        windowsHide: process.platform === "win32",
         shell: false,
       });
 

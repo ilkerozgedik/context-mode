@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
-import { evaluateCommandDenyOnly } from "../src/security.js";
+import { isPathInsideProject } from "../src/security.js";
 import { ContentStore } from "../src/store.js";
 
 const tempDirs: string[] = [];
@@ -46,11 +46,10 @@ describe("runtime and executor", () => {
 });
 
 describe("security", () => {
-  test("deny rules apply inside chained commands", () => {
-    const result = evaluateCommandDenyOnly("echo ok && sudo echo blocked", [
-      { allow: [], ask: [], deny: ["Bash(sudo *)"] },
-    ]);
-    expect(result.decision).toBe("deny");
+  test("project containment rejects parent traversal", () => {
+    const root = tempDir();
+    expect(isPathInsideProject("inside.txt", root)).toBe(true);
+    expect(isPathInsideProject("../parent.txt", root)).toBe(false);
   });
 });
 

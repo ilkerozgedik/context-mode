@@ -5,29 +5,8 @@ import { relative, resolve, sep } from "node:path";
 const defaultGlobalSettingsPath = () => resolve(homedir(), ".claude", "settings.json");
 
 // ==============================================================================
-// Types
+// File permission pattern parsing
 // ==============================================================================
-
-export interface SecurityPolicy {
-  allow: string[];
-  deny: string[];
-  ask: string[];
-}
-
-// ==============================================================================
-// Pattern Parsing
-// ==============================================================================
-
-/**
- * Extract the glob from a Bash permission pattern.
- * "Bash(sudo *)" returns "sudo *", "Read(.env)" returns null.
- */
-export function parseBashPattern(pattern: string): string | null {
-  // .+ is greedy: for "Bash(echo (foo))" it captures "echo (foo)"
-  // because $ forces the final \) to match only the last paren.
-  const match = pattern.match(/^Bash\((.+)\)$/);
-  return match ? match[1] : null;
-}
 
 /**
  * Parse any tool permission pattern like "ToolName(glob)".
@@ -46,53 +25,10 @@ export function parseToolPattern(
 // Glob-to-Regex Conversion
 // ==============================================================================
 
-/** Escape all regex special characters (including *). */
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\\/\-]/g, "\\$&");
-}
-
-/** Escape regex specials except *, then convert * to .* */
-function convertGlobPart(glob: string): string {
-  return glob
-    .replace(/[.+?^${}()|[\]\\\/\-]/g, "\\$&")
-    .replace(/\*/g, ".*");
-}
-
-/**
- * Convert a Bash permission glob to a regex.
- *
- * Two formats:
- * - Colon: "tree:*" becomes /^tree(\s.*)?$/ (command with optional args)
- * - Space: "sudo *" becomes /^sudo .*$/  (literal glob match)
- */
-export function globToRegex(
-  glob: string,
-  caseInsensitive: boolean = false,
-): RegExp {
-  let regexStr: string;
-
-  const colonIdx = glob.indexOf(":");
-  if (colonIdx !== -1) {
-    // Colon format: "command:argsGlob"
-    const command = glob.slice(0, colonIdx);
-    const argsGlob = glob.slice(colonIdx + 1);
-    const escapedCmd = escapeRegex(command);
-    const argsRegex = convertGlobPart(argsGlob);
-    // Match command alone OR command + space + args
-    regexStr = `^${escapedCmd}(\\s${argsRegex})?$`;
-  } else {
-    // Plain glob: "sudo *", "ls*", "* commit *"
-    regexStr = `^${convertGlobPart(glob)}$`;
-  }
-
-  return new RegExp(regexStr, caseInsensitive ? "i" : "");
-}
-
 /**
  * Convert a file path glob to a regex.
  *
- * Unlike `globToRegex` (which handles command patterns with colon and
- * space semantics), this handles file path globs where:
+ * File path semantics:
  * - `**` matches any number of path segments (including zero)
  * - `*` matches anything except path separators
  * - Paths are matched with forward slashes (callers normalize first)
@@ -133,266 +69,14 @@ export function fileGlobToRegex(
   return new RegExp(`^${regexStr}$`, caseInsensitive ? "i" : "");
 }
 
-/**
- * Check if a command matches any Bash pattern in the list.
- * Returns the matching pattern string, or null.
- */
-export function matchesAnyPattern(
-  command: string,
-  patterns: string[],
-  caseInsensitive: boolean = false,
-): string | null {
-  for (const pattern of patterns) {
-    const glob = parseBashPattern(pattern);
-    if (!glob) continue;
-    if (globToRegex(glob, caseInsensitive).test(command)) return pattern;
-  }
-  return null;
-}
-
-// ==============================================================================
-// Chained Command Splitting & Subshell Extraction
-// ==============================================================================
-
-function isEscaped(command: string, index: number): boolean {
-  let backslashes = 0;
-  for (let i = index - 1; i >= 0 && command[i] === "\\"; i--) {
-    backslashes++;
-  }
-  return backslashes % 2 === 1;
-}
-
-/**
- * Split a shell command on chain operators (&&, ||, ;, |, \n, \r, &) while
- * respecting single/double quotes, backticks, subshells, and escape backslashes.
- *
- * "echo hello && sudo rm -rf /" → ["echo hello", "sudo rm -rf /"]
- *
- * This prevents bypassing deny patterns by prepending innocent commands.
- */
-export function splitChainedCommands(command: string): string[] {
-  const parts: string[] = [];
-  let current = "";
-  let inSingle = false;
-  let inDouble = false;
-  let inBacktick = false;
-  let dollarParenDepth = 0;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    const escaped = isEscaped(command, i);
-
-    if (ch === "'" && !inDouble && !inBacktick && !escaped) {
-      inSingle = !inSingle;
-      current += ch;
-    } else if (ch === '"' && !inSingle && !inBacktick && !escaped) {
-      inDouble = !inDouble;
-      current += ch;
-    } else if (ch === "`" && !inSingle && !inDouble && !escaped) {
-      inBacktick = !inBacktick;
-      current += ch;
-    } else if (!inSingle && !inDouble && !inBacktick) {
-      if (ch === "$" && command[i + 1] === "(" && !escaped) {
-        dollarParenDepth++;
-        current += ch + command[i + 1];
-        i++;
-      } else if (dollarParenDepth > 0 && ch === "(" && !escaped) {
-        dollarParenDepth++;
-        current += ch;
-      } else if (ch === ")" && dollarParenDepth > 0 && !escaped) {
-        dollarParenDepth--;
-        current += ch;
-      } else if (
-        dollarParenDepth === 0 &&
-        (ch === ";" || ch === "\n" || ch === "\r") &&
-        !escaped
-      ) {
-        parts.push(current.trim());
-        current = "";
-      } else if (dollarParenDepth === 0 && ch === "|" && command[i + 1] === "|") {
-        parts.push(current.trim());
-        current = "";
-        i++; // skip second |
-      } else if (dollarParenDepth === 0 && ch === "&" && command[i + 1] === "&") {
-        parts.push(current.trim());
-        current = "";
-        i++; // skip second &
-      } else if (dollarParenDepth === 0 && ch === "&" && !escaped) {
-        parts.push(current.trim());
-        current = "";
-      } else if (dollarParenDepth === 0 && ch === "|") {
-        // Single pipe — left side is a command too
-        parts.push(current.trim());
-        current = "";
-      } else {
-        current += ch;
-      }
-    } else {
-      current += ch;
-    }
-  }
-  if (current.trim()) parts.push(current.trim());
-  return parts.filter((p) => p.length > 0);
-}
-
-/**
- * Recursively extract all nested subshell commands from `$()` and `` `...` ``.
- * Handles escaping and quote contexts to ensure correct command boundary detection.
- */
-export function extractSubshellCommands(command: string): string[] {
-  const subshells: string[] = [];
-  let inSingle = false;
-  let inDouble = false;
-  let backtickStart = -1;
-
-  const dollarParenStarts: number[] = [];
-  const dollarParenDepths: number[] = [];
-  let parenDepth = 0;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    const escaped = isEscaped(command, i);
-
-    if (ch === "'" && !inDouble && backtickStart === -1 && !escaped) {
-      inSingle = !inSingle;
-    } else if (ch === '"' && !inSingle && backtickStart === -1 && !escaped) {
-      inDouble = !inDouble;
-    } else if (ch === "`" && !inSingle && !inDouble && !escaped) {
-      if (backtickStart === -1) {
-        backtickStart = i + 1;
-      } else {
-        const sub = command.slice(backtickStart, i);
-        subshells.push(sub);
-        subshells.push(...extractSubshellCommands(sub));
-        backtickStart = -1;
-      }
-    } else if (!inSingle && backtickStart === -1) {
-      if (ch === "$" && command[i + 1] === "(" && !escaped) {
-        if (command[i + 2] === "(") {
-          // Arithmetic expansion is not command execution, but nested command
-          // substitutions inside it still get discovered by the scanner.
-          parenDepth += 2;
-          i += 2; // skip '(('
-        } else {
-          dollarParenStarts.push(i + 2);
-          dollarParenDepths.push(parenDepth);
-          parenDepth++;
-          i++; // skip '('
-        }
-      } else if (ch === "(" && !escaped) {
-        parenDepth++;
-      } else if (ch === ")" && !escaped) {
-        if (parenDepth > 0) {
-          parenDepth--;
-        }
-        if (
-          dollarParenDepths.length > 0 &&
-          parenDepth === dollarParenDepths[dollarParenDepths.length - 1]
-        ) {
-          dollarParenDepths.pop();
-          const start = dollarParenStarts.pop()!;
-          const sub = command.slice(start, i);
-          subshells.push(sub);
-        }
-      }
-    }
-  }
-  return subshells;
-}
-
-function collectCommandElements(command: string): string[] {
-  const elements: string[] = [];
-  const segments = splitChainedCommands(command);
-  for (const segment of segments) {
-    elements.push(segment);
-    for (const subshell of extractSubshellCommands(segment)) {
-      elements.push(...collectCommandElements(subshell));
-    }
-  }
-  return elements;
-}
-
 // ==============================================================================
 // Settings Reader
 // ==============================================================================
 
-/** Read one settings file and return a SecurityPolicy with only Bash patterns. */
-function readSingleSettings(path: string): SecurityPolicy | null {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch {
-    return null;
-  }
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-
-  const perms = parsed?.permissions;
-  if (!perms || typeof perms !== "object") return null;
-
-  const filterBash = (arr: unknown): string[] => {
-    if (!Array.isArray(arr)) return [];
-    return arr.filter(
-      (p): p is string => typeof p === "string" && parseBashPattern(p) !== null,
-    );
-  };
-
-  return {
-    allow: filterBash(perms.allow),
-    deny: filterBash(perms.deny),
-    ask: filterBash(perms.ask),
-  };
-}
-
-/**
- * Read Bash permission policies from up to 3 settings files.
- *
- * Returns policies in precedence order (most local first):
- *   1. .claude/settings.local.json  (project-local)
- *   2. .claude/settings.json        (project-shared)
- *   3. ~/.claude/settings.json      (global)
- *
- * Missing or invalid files are silently skipped.
- */
-export function readBashPolicies(
-  projectDir?: string,
-  globalSettingsPath?: string,
-): SecurityPolicy[] {
-  const policies: SecurityPolicy[] = [];
-
-  if (projectDir) {
-    const localPath = resolve(projectDir, ".claude", "settings.local.json");
-    const localPolicy = readSingleSettings(localPath);
-    if (localPolicy) policies.push(localPolicy);
-
-    const sharedPath = resolve(projectDir, ".claude", "settings.json");
-    const sharedPolicy = readSingleSettings(sharedPath);
-    if (sharedPolicy) policies.push(sharedPolicy);
-  }
-
-  // Issue #451 round-3: read settings from EVERY adapter-specific global path
-  // PLUS the claude global (defense in depth). When the caller passes an
-  // explicit globalSettingsPath we honor it verbatim (back-compat with tests
-  // and callers that already know which file to read).
-  const globalPaths = [globalSettingsPath ?? defaultGlobalSettingsPath()];
-
-  for (const globalPath of globalPaths) {
-    const globalPolicy = readSingleSettings(globalPath);
-    if (globalPolicy) policies.push(globalPolicy);
-  }
-
-  return policies;
-}
-
 /**
  * Read deny patterns for a specific tool from settings files.
  *
- * Reads the same 3-tier settings as `readBashPolicies`, but extracts
+ * Reads the configured settings tiers and extracts
  * only deny globs for the given tool. Used for Read and Grep enforcement
  * — checks if file paths should be blocked by deny patterns.
  *
@@ -409,7 +93,7 @@ export function readToolDenyPatterns(
 
 /**
  * Read `permissions.{deny|allow}` globs for a tool from every settings file in
- * precedence order (project local → project shared → adapter globals).
+ * precedence order (project local → project shared → global).
  *
  * Generalizes the original deny-only reader so the project-boundary guard
  * (#852) can consult the SAME `permissions.allow` rules the user already
@@ -468,10 +152,7 @@ export function readToolPermissionPatterns(
     if (sharedGlobs !== null) result.push(sharedGlobs);
   }
 
-  // Issue #451 round-3: union over every adapter-specific global path PLUS
-  // claude global. Each settings file contributes its own globs array entry
-  // so the precedence ordering downstream remains per-file rather than
-  // collapsed.
+  // Keep the global settings file as its own precedence tier.
   const globalPaths = [globalSettingsPath ?? defaultGlobalSettingsPath()];
 
   for (const globalPath of globalPaths) {
@@ -480,35 +161,6 @@ export function readToolPermissionPatterns(
   }
 
   return result;
-}
-
-// ==============================================================================
-// Decision Engine
-// ==============================================================================
-
-/**
- * Server-side variant: only enforce deny patterns.
- *
- * The server has no UI for "ask" prompts, so allow/ask patterns are
- * irrelevant. Returns "deny" if any deny pattern matches, otherwise "allow".
- *
- * Also splits chained commands and nested subshells to prevent bypass.
- */
-export function evaluateCommandDenyOnly(
-  command: string,
-  policies: SecurityPolicy[],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
-): { decision: "deny" | "allow"; matchedPattern?: string } {
-  const allCommands = collectCommandElements(command);
-
-  for (const cmdElement of allCommands) {
-    for (const policy of policies) {
-      const denyMatch = matchesAnyPattern(cmdElement, policy.deny, caseInsensitive);
-      if (denyMatch) return { decision: "deny", matchedPattern: denyMatch };
-    }
-  }
-
-  return { decision: "allow" };
 }
 
 // ==============================================================================
@@ -591,10 +243,8 @@ export function evaluateFilePath(
  * into `resolve(projectRoot, path)`. Because `path.resolve` lets an *absolute*
  * argument win outright, an agent could read any file on the host
  * (`/home/user/secret`, `/etc/passwd`) regardless of the project root, and
- * `../` traversal escaped just as easily. Claude Code's harness sandbox cannot
- * inspect MCP input params, so the user approving the MCP call could not see
- * that the path escaped the workspace. This guard re-anchors the path to the
- * project boundary.
+ * `../` traversal escaped just as easily. This guard re-anchors the selected
+ * path to the project boundary.
  *
  * Containment is decided on the *resolved* form. When the file (or its parent
  * chain) exists, the symlink-canonical form is ALSO required to stay inside —
@@ -674,9 +324,7 @@ function isAbsoluteRel(rel: string): boolean {
  *      the user already configured for the host → allowed. This is the
  *      principled escape hatch: a deliberate out-of-project read is expressed
  *      ONCE in the host config the user already maintains, reusing the same
- *      mechanism Claude Code itself uses to whitelist a path outside the
- *      sandbox — no context-mode-specific opt-out env that would rot into
- *      dead code.
+ *      host Read allow rules already used for path access.
  *   3. Outside the project, no allow match → denied (closes the #852 escape).
  *
  * `allowGlobs` has the same per-settings-file shape as the deny globs returned
@@ -704,89 +352,4 @@ export function evaluateProjectContainment(
     if (matched.denied) return { allowed: true, reason: "allow-rule" };
   }
   return { allowed: false, reason: "outside" };
-}
-
-// ==============================================================================
-// Shell-Escape Scanner
-// ==============================================================================
-
-// Regex patterns that detect shell-escape calls in non-shell languages.
-// Each pattern uses capture groups so that the embedded command string
-// can be extracted from the last non-quote group.
-//
-// NOTE: These regexes contain literal strings like "execSync" — they are
-// patterns for *detecting* shell escapes in user code, not actual usage.
-const SHELL_ESCAPE_PATTERNS: Record<string, RegExp[]> = {
-  python: [
-    /os\.system\(\s*(['"])(.*?)\1\s*\)/g,
-    /subprocess\.(?:run|call|Popen|check_output|check_call)\(\s*(['"])(.*?)\1/g,
-  ],
-  javascript: [
-    /exec(?:Sync|File|FileSync)?\(\s*(['"`])(.*?)\1/g,
-    /spawn(?:Sync)?\(\s*(['"`])(.*?)\1/g,
-  ],
-};
-
-/**
- * Extract all string elements from a Python subprocess list call.
- *
- * subprocess.run(["rm", "-rf", "/"]) → "rm -rf /"
- *
- * This catches the list-of-strings form that the single-string regex misses.
- */
-function extractPythonSubprocessListArgs(code: string): string[] {
-  const commands: string[] = [];
-  const pattern =
-    /subprocess\.(?:run|call|Popen|check_output|check_call)\(\s*\[([^\]]+)\]/g;
-
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(code)) !== null) {
-    const listContent = match[1];
-    const args = [...listContent.matchAll(/(['"])(.*?)\1/g)].map((m) => m[2]);
-    if (args.length > 0) {
-      commands.push(args.join(" "));
-    }
-  }
-
-  return commands;
-}
-
-/**
- * Scan non-shell code for shell-escape calls and extract the embedded
- * command strings.
- *
- * Returns an array of command strings found in the code. For unknown
- * languages or code without shell-escape calls, returns an empty array.
- */
-export function extractShellCommands(
-  code: string,
-  language: string,
-): string[] {
-  const patterns = SHELL_ESCAPE_PATTERNS[language];
-  if (!patterns && language !== "python") return [];
-
-  const commands: string[] = [];
-
-  if (patterns) {
-    for (const pattern of patterns) {
-      // Reset lastIndex since we reuse the global regex
-      pattern.lastIndex = 0;
-
-      let match: RegExpExecArray | null;
-      while ((match = pattern.exec(code)) !== null) {
-        // The command string is in the last capture group that isn't the
-        // quote delimiter. For patterns with 2 groups (quote + content),
-        // it's group 2. For Ruby backticks with 1 group, it's group 1.
-        const command = match[match.length - 1];
-        if (command) commands.push(command);
-      }
-    }
-  }
-
-  // Python: also extract subprocess list-form args
-  if (language === "python") {
-    commands.push(...extractPythonSubprocessListArgs(code));
-  }
-
-  return commands;
 }

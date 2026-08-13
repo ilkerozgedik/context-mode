@@ -163,18 +163,7 @@ function toPosixRel(rootPath: string, absPath: string): string {
 }
 
 /**
- * Walk `rootPath` recursively under the given bounds and return absolute file
- * paths matching the filters. Pure synchronous traversal — no allocations
- * beyond the result array. Symlink cycles are detected via a resolved-path
- * Set; symlink escapes (resolving outside rootPath) are silently skipped.
- */
-export function walkDirectory(rootPath: string, opts: WalkOptions = {}): string[] {
-  return walkDirectoryDetailed(rootPath, opts).files;
-}
-
-/**
- * Same as walkDirectory but returns capped + totalSeen so callers can surface
- * a "capped at N files" notice in their response.
+ * Walk a directory under bounded depth/file limits and return cap metadata.
  */
 export function walkDirectoryDetailed(rootPath: string, opts: WalkOptions = {}): WalkResult {
   const {

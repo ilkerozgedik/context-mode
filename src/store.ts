@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,8 +39,8 @@ type SearchRow = {
   highlighted: string;
 };
 
-import type { IndexResult, SearchResult, StoreStats } from "./types.js";
-export type { IndexResult, SearchResult, StoreStats } from "./types.js";
+import type { IndexResult, SearchResult } from "./types.js";
+export type { IndexResult, SearchResult } from "./types.js";
 
 // ─────────────────────────────────────────────────────────
 // Constants
@@ -170,53 +170,6 @@ const WHITESPACE_BREAK_RATIO = 0.5;
 // ─────────────────────────────────────────────────────────
 // ContentStore
 // ─────────────────────────────────────────────────────────
-
-/**
- * Clean up stale per-project content store DBs older than maxAgeDays.
- * Scans the given directory for *.db files and checks mtime.
- * Also detects zombie processes holding WAL locks — if a WAL file exists
- * but the owning PID is dead, the DB files are cleaned up regardless of age.
- */
-export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
-  let cleaned = 0;
-  try {
-    if (!existsSync(contentDir)) return 0;
-    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const files = readdirSync(contentDir).filter(f => f.endsWith(".db"));
-    for (const file of files) {
-      try {
-        const filePath = join(contentDir, file);
-        const mtime = statSync(filePath).mtimeMs;
-        let shouldClean = mtime < cutoff;
-
-        // Detect zombie processes holding WAL locks:
-        // If a WAL file exists, try to read the WAL header to extract the PID.
-        // WAL files from dead processes can block new connections.
-        if (!shouldClean) {
-          const walPath = filePath + "-wal";
-          if (existsSync(walPath)) {
-            try {
-              const walStat = statSync(walPath);
-              // If WAL file is non-empty and DB hasn't been modified in >1 hour,
-              // the owning process may be dead — check via mtime staleness
-              if (walStat.size > 0 && (Date.now() - walStat.mtimeMs) > 3600_000) {
-                shouldClean = true;
-              }
-            } catch { /* ignore WAL check errors */ }
-          }
-        }
-
-        if (shouldClean) {
-          for (const suffix of ["", "-wal", "-shm"]) {
-            try { unlinkSync(filePath + suffix); } catch { /* ignore */ }
-          }
-          cleaned++;
-        }
-      } catch { /* ignore per-file errors */ }
-    }
-  } catch { /* ignore readdir errors */ }
-  return cleaned;
-}
 
 // ── Proximity helpers (pure functions) ──
 
@@ -352,13 +305,8 @@ export class ContentStore {
   #stmtChunksBySource!: PreparedStatement;
   #stmtSourceChunkCount!: PreparedStatement;
   #stmtChunkContent!: PreparedStatement;
-  #stmtStats!: PreparedStatement;
   #stmtSourceMeta!: PreparedStatement;
 
-  // Cleanup path
-  #stmtCleanupChunks!: PreparedStatement;
-  #stmtCleanupChunksTrigram!: PreparedStatement;
-  #stmtCleanupSources!: PreparedStatement;
 
   // FTS5 optimization: track inserts and optimize periodically to defragment
   // the index. FTS5 b-trees fragment over many insert/delete cycles, degrading
@@ -735,23 +683,6 @@ export class ContentStore {
     );
     this.#stmtSourceMeta = this.#db.prepare(
       "SELECT label, chunk_count, code_chunk_count, indexed_at, file_path, content_hash FROM sources WHERE label = ?",
-    );
-    this.#stmtStats = this.#db.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM sources) AS sources,
-        (SELECT COUNT(*) FROM chunks) AS chunks,
-        (SELECT COUNT(*) FROM chunks WHERE content_type = 'code') AS codeChunks
-    `);
-
-    // Cleanup path — cached to avoid recompiling SQL on each periodic call
-    this.#stmtCleanupChunks = this.#db.prepare(
-      "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    this.#stmtCleanupChunksTrigram = this.#db.prepare(
-      "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    this.#stmtCleanupSources = this.#db.prepare(
-      "DELETE FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days')",
     );
   }
 
@@ -1423,36 +1354,8 @@ export class ContentStore {
       .map((s: { word: string; score: number }) => s.word);
   }
 
-  // ── Stats ──
-
-  getStats(): StoreStats {
-    const row = this.#stmtStats.get() as {
-      sources: number;
-      chunks: number;
-      codeChunks: number;
-    } | undefined;
-
-    return {
-      sources: row?.sources ?? 0,
-      chunks: row?.chunks ?? 0,
-      codeChunks: row?.codeChunks ?? 0,
-    };
-  }
-
-  // ── Cleanup ──
-
-  /**
-   * Delete sources (and their chunks) older than maxAgeDays.
-   * Returns count of deleted sources.
-   */
-  cleanupStaleSources(maxAgeDays: number): number {
-    const cleanup = this.#db.transaction((days: number) => {
-      this.#stmtCleanupChunks.run(days);
-      this.#stmtCleanupChunksTrigram.run(days);
-      return this.#stmtCleanupSources.run(days);
-    });
-    const info = cleanup(maxAgeDays);
-    return info.changes;
+  isEmpty(): boolean {
+    return this.#db.prepare("SELECT 1 FROM chunks LIMIT 1").get() === undefined;
   }
 
   /** Merge FTS5 b-tree segments for both porter and trigram indexes. */

@@ -10,6 +10,8 @@ A public fork of [mksglu/context-mode](https://github.com/mksglu/context-mode) o
 - Keeps only the stdio server and core execution/index/search/fetch/purge/diagnostics source.
 - `ctx_execute` and `ctx_execute_file` support only JavaScript, Python, and shell.
 - Session-memory/timeline plumbing is removed; `ctx_search` queries only the persistent FTS5 content store.
+- Indexed content remains persistent until explicit `ctx_purge`; there is no age-based automatic deletion.
+- Execution tools run child processes with the MCP server OS permissions; host approval and the OS account are the execution boundary.
 - Agent adapters, hooks, plugins, statusline, CLI helpers, and Insight assets are removed from the fork.
 
 ## 1MCP configuration

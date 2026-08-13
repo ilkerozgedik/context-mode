@@ -11,11 +11,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleContentDBs, type IndexResult } from "./store.js";
+import { ContentStore, type IndexResult } from "./store.js";
 import {
-  readBashPolicies,
-  evaluateCommandDenyOnly,
-  extractShellCommands,
   readToolDenyPatterns,
   readToolPermissionPatterns,
   evaluateFilePath,
@@ -184,16 +181,6 @@ function getStore(): ContentStore {
       }
     });
 
-    // One-time startup cleanup: remove stale content DBs (>14 days)
-    try {
-      const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
-      _store.cleanupStaleSources(14);
-      // Also clean legacy shared dir from before platform isolation
-      const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
-    } catch { /* best-effort */ }
-
   }
   return _store;
 }
@@ -203,83 +190,22 @@ type ToolResult = {
   isError?: boolean;
 };
 
-function trackResponse(_toolName: string, response: ToolResult): ToolResult {
-  return response;
-}
-
-function securityCheckFailed(toolName: string): ToolResult {
-  return trackResponse(toolName, {
+function securityCheckFailed(): ToolResult {
+  return {
     content: [{ type: "text", text: "Security policy check failed; request blocked." }],
     isError: true,
-  });
+  };
 }
 
 // ==============================================================================
-// Security: server-side deny firewall
+// Security: selected file-path controls
 // ==============================================================================
 
 /**
- * Check a shell command against Bash deny patterns.
- * Returns an error ToolResult if denied, or null if allowed.
- */
-function checkDenyPolicy(
-  command: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const policies = readBashPolicies(getProjectDir());
-    const result = evaluateCommandDenyOnly(command, policies);
-    if (result.decision === "deny") {
-      return trackResponse(toolName, {
-        content: [{
-          type: "text" as const,
-          text: `Command blocked by security policy: matches deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      });
-    }
-  } catch {
-    return securityCheckFailed(toolName);
-  }
-  return null;
-}
-
-/**
- * Check non-shell code for shell-escape calls against deny patterns.
- */
-function checkNonShellDenyPolicy(
-  code: string,
-  language: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const commands = extractShellCommands(code, language);
-    if (commands.length === 0) return null;
-    const policies = readBashPolicies(getProjectDir());
-    for (const cmd of commands) {
-      const result = evaluateCommandDenyOnly(cmd, policies);
-      if (result.decision === "deny") {
-        return trackResponse(toolName, {
-          content: [{
-            type: "text" as const,
-            text: `Command blocked by security policy: embedded shell command "${cmd}" matches deny pattern ${result.matchedPattern}`,
-          }],
-          isError: true,
-        });
-      }
-    }
-  } catch {
-    return securityCheckFailed(toolName);
-  }
-  return null;
-}
-
-/**
- * Issue #852 — project-boundary containment for `ctx_execute_file`.
- *
- * Refuses a path that resolves outside the configured project root (absolute
- * escape, `../` traversal, or symlink-out). Explicit `Read(...)` allow rules
- * remain the escape hatch for intentional out-of-project reads.
+ * Constrain file-path arguments to the configured project root. Explicit
+ * `Read(...)` allow rules remain the escape hatch for intentional external
+ * paths. This protects the selected input path only; execution tools still run
+ * user code with the MCP server process's OS permissions.
  */
 function checkProjectBoundary(
   filePath: string,
@@ -290,20 +216,19 @@ function checkProjectBoundary(
     const allowGlobs = readToolPermissionPatterns("Read", "allow", projectDir);
     const verdict = evaluateProjectContainment(filePath, projectDir, allowGlobs);
     if (verdict.allowed) return null;
-    return trackResponse(toolName, {
+    return {
       content: [{
         type: "text" as const,
         text:
           `File access blocked: "${filePath}" resolves outside the project root ` +
-          `(${projectDir}). context-mode confines ${toolName} to the workspace so it ` +
-          `cannot be used to bypass the host's sandbox/permission controls (issue #852). ` +
-          `To intentionally process a file outside the project, add a host allow rule, ` +
+          `(${projectDir}). The ${toolName} path argument is workspace-scoped. ` +
+          `To intentionally select a file outside the project, add a host allow rule, ` +
           `e.g. "permissions": { "allow": ["Read(${filePath})"] } in your settings.`,
       }],
       isError: true,
-    });
+    };
   } catch {
-    return securityCheckFailed(toolName);
+    return securityCheckFailed();
   }
   return null;
 }
@@ -314,7 +239,6 @@ function checkProjectBoundary(
  */
 function checkFilePathDenyPolicy(
   filePath: string,
-  toolName: string,
 ): ToolResult | null {
   try {
     const projectDir = getProjectDir();
@@ -326,16 +250,16 @@ function checkFilePathDenyPolicy(
       projectDir,
     );
     if (result.denied) {
-      return trackResponse(toolName, {
+      return {
         content: [{
           type: "text" as const,
           text: `File access blocked by security policy: path matches Read deny pattern ${result.matchedPattern}`,
         }],
         isError: true,
-      });
+      };
     }
   } catch {
-    return securityCheckFailed(toolName);
+    return securityCheckFailed();
   }
   return null;
 }
@@ -573,21 +497,9 @@ function truncateCommandForEcho(command: string): string {
 }
 
 /**
- * Default execution timeout (ms) applied ONLY under Antigravity CLI (`agy`).
- * agy does not enforce an MCP RPC timeout, so a ctx_execute with a runaway or
- * blocking script hangs forever — the host never kills it and the user must
- * interrupt. Every other host enforces its own RPC timeout, so we keep the
- * no-server-timer behavior there (Issue #406 — long builds need an unbounded
- * run). A caller can still pass an explicit `timeout` to override on any host.
- */
-export function resolveExecTimeout(timeout: number | undefined): number | undefined {
-  return timeout;
-}
-
-/**
  * Per-call budget for the source-code echo prepended by `ctx_execute` and
  * `ctx_execute_file` (Issues #717 + #736). The full code always reaches the
- * sandbox — only the echo is clipped so massive payloads don't dominate
+ * child process — only the echo is clipped so massive payloads don't dominate
  * the response. Multi-line preserved (unlike command echo) so the user
  * sees the actual program shape.
  */
@@ -732,15 +644,15 @@ registerCtxTool(
   {
     // #852: surface code execution in the host approval prompt's title (the
     // only server-controlled field the MCP permission UI renders besides args).
-    title: "Run code in a sandbox (executes the supplied code)",
-    // #846: runs arbitrary code in a sandbox with full network access.
+    title: "Run code (uses MCP server OS permissions)",
+    // Runs arbitrary code as a child process with the MCP server OS permissions.
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Run code in a sandbox to process large or unpredictable output. Print only the findings that should enter context; use ctx_batch_execute for multiple related commands.",
+    description: "Run code as a child process with the MCP server OS permissions. Print only findings that should enter context; use ctx_batch_execute for related commands.",
     inputSchema: z.object({
       language: z
 .enum(["javascript", "python", "shell"])
@@ -768,15 +680,6 @@ registerCtxTool(
     }),
   },
   async ({ language, code, timeout, background, cwd, intent }) => {
-    // Security: deny-only firewall
-    if (language === "shell") {
-      const denied = checkDenyPolicy(code, "execute");
-      if (denied) return denied;
-    } else {
-      const denied = checkNonShellDenyPolicy(code, language, "execute");
-      if (denied) return denied;
-    }
-
     try {
       // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
@@ -845,11 +748,10 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const effTimeout = resolveExecTimeout(timeout);
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout: timeout, background, cwd });
 
       // Echo the executed source code before stdout so users can audit
-      // and tooling can block command patterns (Issues #717 + #736).
+      // and host approval UIs can audit the exact payload (Issues #717 + #736).
       // Built from the user-supplied `code`, NOT the instrumented variant.
       const echo = buildExecuteEcho(language, code);
 
@@ -870,35 +772,35 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         const partialOutput = result.stdout?.trim();
         if (result.backgrounded && partialOutput) {
           // Background mode: process is still running, return partial output as success
-          return trackResponse("ctx_execute", {
+          return {
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${effTimeout}ms — still running)_`,
+                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
               },
             ],
-          });
+          };
         }
         if (partialOutput) {
           // Timeout with partial output — return as success with note
-          return trackResponse("ctx_execute", {
+          return {
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(timed out after ${effTimeout}ms — partial output shown above)_`,
+                text: `${echo}${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
               },
             ],
-          });
+          };
         }
-        return trackResponse("ctx_execute", {
+        return {
           content: [
             {
               type: "text" as const,
-              text: `${echo}Execution timed out after ${effTimeout}ms\n\nstderr:\n${result.stderr}`,
+              text: `${echo}Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
             },
           ],
           isError: true,
-        });
+        };
       }
 
       if (result.exitCode !== 0) {
@@ -906,39 +808,39 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return trackResponse("ctx_execute", {
+          return {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
-          });
+          };
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          return trackResponse("ctx_execute", {
+          return {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
-          });
+          };
         }
-        return trackResponse("ctx_execute", {
+        return {
           content: [
             { type: "text" as const, text: `${echo}${output}` },
           ],
           isError,
-        });
+        };
       }
 
       const stdout = result.stdout || "(no output)";
 
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        return trackResponse("ctx_execute", {
+        return {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
           ],
-        });
+        };
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
@@ -953,22 +855,22 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
               : c,
           ),
         };
-        return trackResponse("ctx_execute", echoed);
+        return echoed;
       }
 
-      return trackResponse("ctx_execute", {
+      return {
         content: [
           { type: "text" as const, text: `${echo}${stdout}` },
         ],
-      });
+      };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_execute", {
+      return {
         content: [
           { type: "text" as const, text: `Runtime error: ${message}` },
         ],
         isError: true,
-      });
+      };
     }
   },
 );
@@ -1066,15 +968,15 @@ registerCtxTool(
     // #852: the host's MCP approval prompt renders only the tool name/title +
     // raw args — the title is the one server-controlled signal, so make it
     // unambiguously announce code execution + file read for the reviewer.
-    title: "Run code over a file (executes code, reads the given path)",
-    // #846: runs arbitrary code over a file in a sandbox with full network access.
+    title: "Run code over a file (uses MCP server OS permissions)",
+    // Runs arbitrary code over the selected file with the MCP server OS permissions.
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Analyze a file without loading it into context. Code receives the file as FILE_CONTENT; only printed output is returned.",
+    description: "Analyze a selected project file without loading it into context. Code receives FILE_CONTENT and runs with the MCP server OS permissions; only printed output is returned.",
     inputSchema: z.object({
       path: z
         .string()
@@ -1096,32 +998,21 @@ registerCtxTool(
     }),
   },
   async ({ path, language, code, timeout, intent }) => {
-    // Security (#852): confine the processed file to the project root so
-    // ctx_execute_file cannot be used to escape the host's sandbox/permission
-    // controls. Runs before the deny-glob check — boundary first, then policy.
+    // Constrain the selected input path before applying optional Read deny rules.
+    // The supplied code itself still runs with the MCP server OS permissions.
     const boundaryDenied = checkProjectBoundary(path, "ctx_execute_file");
     if (boundaryDenied) return boundaryDenied;
 
     // Security: check file path against Read deny patterns
-    const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
+    const pathDenied = checkFilePathDenyPolicy(path);
     if (pathDenied) return pathDenied;
 
-    // Security: check code parameter against Bash deny patterns
-    if (language === "shell") {
-      const codeDenied = checkDenyPolicy(code, "execute_file");
-      if (codeDenied) return codeDenied;
-    } else {
-      const codeDenied = checkNonShellDenyPolicy(code, language, "execute_file");
-      if (codeDenied) return codeDenied;
-    }
-
     try {
-      const effTimeout = resolveExecTimeout(timeout);
       const result = await executor.executeFile({
         path,
         language,
         code,
-        timeout: effTimeout,
+        timeout: timeout,
       });
 
       // Echo path + executed source code before stdout for audit/debug
@@ -1129,15 +1020,15 @@ registerCtxTool(
       const echo = buildExecuteEcho(language, code, path);
 
       if (result.timedOut) {
-        return trackResponse("ctx_execute_file", {
+        return {
           content: [
             {
               type: "text" as const,
-              text: `${echo}Timed out processing ${path} after ${effTimeout}ms`,
+              text: `${echo}Timed out processing ${path} after ${timeout}ms`,
             },
           ],
           isError: true,
-        });
+        };
       }
 
       if (result.exitCode !== 0) {
@@ -1145,38 +1036,38 @@ registerCtxTool(
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return trackResponse("ctx_execute_file", {
+          return {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
-          });
+          };
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          return trackResponse("ctx_execute_file", {
+          return {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
-          });
+          };
         }
-        return trackResponse("ctx_execute_file", {
+        return {
           content: [
             { type: "text" as const, text: `${echo}${output}` },
           ],
           isError,
-        });
+        };
       }
 
       const stdout = result.stdout || "(no output)";
 
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        return trackResponse("ctx_execute_file", {
+        return {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
           ],
-        });
+        };
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
@@ -1190,22 +1081,22 @@ registerCtxTool(
               : c,
           ),
         };
-        return trackResponse("ctx_execute_file", echoed);
+        return echoed;
       }
 
-      return trackResponse("ctx_execute_file", {
+      return {
         content: [
           { type: "text" as const, text: `${echo}${stdout}` },
         ],
-      });
+      };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_execute_file", {
+      return {
         content: [
           { type: "text" as const, text: `Runtime error: ${message}` },
         ],
         isError: true,
-      });
+      };
     }
   },
 );
@@ -1230,12 +1121,14 @@ registerCtxTool(
     inputSchema: z.object({
       content: z
         .string()
+        .min(1)
         .optional()
         .describe(
           "Small inline text/markdown to index. Use path for files, directories, or large content saved to disk; provide content OR path, not both.",
         ),
       path: z
         .string()
+        .min(1)
         .optional()
         .describe("File or directory path to index; preferred for files, directories, or large content saved to disk. Provide path OR content, not both."),
       source: z
@@ -1265,19 +1158,27 @@ registerCtxTool(
       followSymlinks: z.boolean().optional().describe(
         "Directory-only: follow directory symlinks (default: false — cycle hazard + escape risk).",
       ),
-    }),
+    }).refine(
+      (value) => (value.content === undefined) !== (value.path === undefined),
+      { message: "Provide exactly one of content or path." },
+    ),
   },
   async ({ content, path, source, include, exclude, maxDepth, maxFiles, extensions, respectGitignore, followSymlinks }) => {
-    if (!content && !path) {
-      return trackResponse("ctx_index", {
+    if ((content === undefined) === (path === undefined)) {
+      return {
         content: [
           {
             type: "text" as const,
-            text: "Error: Either content or path must be provided",
+            text: "Error: Provide exactly one of content or path.",
           },
         ],
         isError: true,
-      });
+      };
+    }
+
+    if (path) {
+      const boundaryDenied = checkProjectBoundary(path, "ctx_index");
+      if (boundaryDenied) return boundaryDenied;
     }
 
     // Apply Read deny-policy to prevent indexing sensitive files into the
@@ -1285,7 +1186,7 @@ registerCtxTool(
     // exfiltrate content into the model's context (issue #442). Mirrors the
     // check ctx_execute_file already performs.
     if (path) {
-      const pathDenied = checkFilePathDenyPolicy(path, "ctx_index");
+      const pathDenied = checkFilePathDenyPolicy(path);
       if (pathDenied) return pathDenied;
     }
 
@@ -1313,12 +1214,12 @@ registerCtxTool(
           try {
             realTarget = realpathSync(resolvedPath);
           } catch {
-            return trackResponse("ctx_index", {
+            return {
               content: [{ type: "text" as const, text: "Error: symlink target could not be resolved." }],
-            });
+            };
           }
           if (realTarget !== resolvedPath) {
-            const realDenied = checkFilePathDenyPolicy(realTarget, "ctx_index");
+            const realDenied = checkFilePathDenyPolicy(realTarget);
             if (realDenied) return realDenied;
           }
         }
@@ -1356,35 +1257,35 @@ registerCtxTool(
         const failNote = dirResult.failed > 0
           ? ` (${dirResult.failed} file${dirResult.failed === 1 ? "" : "s"} failed to read)`
           : "";
-        return trackResponse("ctx_index", {
+        return {
           content: [
             {
               type: "text" as const,
               text: `Indexed ${dirResult.filesIndexed} file${dirResult.filesIndexed === 1 ? "" : "s"} (${dirResult.totalChunks} sections) from directory: ${dirResult.label}${capNote}${denyNote}${failNote}\nUse ctx_search(queries: ["..."]) to query this content.`,
             },
           ],
-        });
+        };
       }
 
       const store = getStore();
       const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
 
-      return trackResponse("ctx_index", {
+      return {
         content: [
           {
             type: "text" as const,
             text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
           },
         ],
-      });
+      };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_index", {
+      return {
         content: [
           { type: "text" as const, text: `Index error: ${message}` },
         ],
         isError: true,
-      });
+      };
     }
   },
 );
@@ -1436,26 +1337,26 @@ registerCtxTool(
   async ({ queries, limit = 3, source, contentType }) => {
     try {
       const store = getStore();
-      if (store.getStats().chunks === 0) {
-        return trackResponse("ctx_search", {
+      if (store.isEmpty()) {
+        return {
           content: [{
             type: "text" as const,
             text: "Knowledge base is empty — index content first with ctx_batch_execute, ctx_fetch_and_index, or ctx_index.",
           }],
           isError: true,
-        });
+        };
       }
 
       const now = Date.now();
       const flood = recordSearch(now);
       if (flood.blocked) {
-        return trackResponse("ctx_search", {
+        return {
           content: [{
             type: "text" as const,
             text: `BLOCKED: ${flood.count} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. Batch queries or use ctx_batch_execute.`,
           }],
           isError: true,
-        });
+        };
       }
 
       const effectiveLimit = flood.softCapped ? 1 : Math.min(limit, 2);
@@ -1486,10 +1387,10 @@ registerCtxTool(
       if (store.lastRefreshCount > 0) {
         output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""}.\n\n${output}`;
       }
-      return trackResponse("ctx_search", { content: [{ type: "text" as const, text: output }] });
+      return { content: [{ type: "text" as const, text: output }] };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_search", { content: [{ type: "text" as const, text: `Search error: ${message}` }], isError: true });
+      return { content: [{ type: "text" as const, text: `Search error: ${message}` }], isError: true };
     }
   },
 );
@@ -2148,13 +2049,13 @@ registerCtxTool(
         : [];
 
     if (batch.length === 0) {
-      return trackResponse("ctx_fetch_and_index", {
+      return {
         content: [{
           type: "text" as const,
           text: "ctx_fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
         }],
         isError: true,
-      });
+      };
     }
 
     const isLegacySingle = !requests && batch.length === 1;
@@ -2201,26 +2102,26 @@ registerCtxTool(
     if (isLegacySingle) {
       const r = finalized[0];
       if (r.kind === "cached") {
-        return trackResponse("ctx_fetch_and_index", {
+        return {
           content: [{
             type: "text" as const,
             text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: ${r.ttlStr}).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
           }],
-        });
+        };
       }
       if (r.kind === "fetched") {
         const totalKB = (r.indexed.totalBytes / 1024).toFixed(1);
         const text = [
           `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
-          `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
+          `Full content indexed in the persistent store — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
           "",
           "---",
           "",
           r.indexed.preview,
         ].join("\n");
-        return trackResponse("ctx_fetch_and_index", {
+        return {
           content: [{ type: "text" as const, text }],
-        });
+        };
       }
       // fetch_error — preserve original error wording per reason
       if (r.kind === "fetch_error") {
@@ -2229,16 +2130,16 @@ registerCtxTool(
           : r.reason === "read" ? `Fetched ${r.url} but could not read subprocess output`
           : r.reason === "exit" ? `Failed to fetch ${r.url}: ${r.error}`
           : /* throw */         `Fetch error: ${r.error}`;
-        return trackResponse("ctx_fetch_and_index", {
+        return {
           content: [{ type: "text" as const, text }],
           isError: true,
-        });
+        };
       }
       // job_error
-      return trackResponse("ctx_fetch_and_index", {
+      return {
         content: [{ type: "text" as const, text: `Fetch error: ${r.error}` }],
         isError: true,
-      });
+      };
     }
 
     // Batch response — aggregated summary; isError only when EVERY URL failed.
@@ -2293,10 +2194,10 @@ registerCtxTool(
       ...(snippets.length > 0 ? ["", "---", "", ...snippets] : []),
     ].join("\n");
 
-    return trackResponse("ctx_fetch_and_index", {
+    return {
       content: [{ type: "text" as const, text }],
       isError: errorCount === batch.length, // only mark error if every URL failed
-    });
+    };
   },
 );
 
@@ -2307,15 +2208,15 @@ registerCtxTool(
 registerCtxTool(
   "ctx_batch_execute",
   {
-    title: "Batch Execute & Search",
-    // #846: runs arbitrary shell commands (with network) and indexes output.
+    title: "Batch Execute & Search (uses MCP server OS permissions)",
+    // Runs arbitrary shell commands with the MCP server OS permissions and indexes output.
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: "Run related commands in one call, index their full output, and return query matches. Use for related or large-output commands.",
+    description: "Run related shell commands with the MCP server OS permissions, index their output, and return query matches. Use for related or large-output commands.",
     inputSchema: z.object({
       commands: z.array(
           z.object({
@@ -2358,12 +2259,6 @@ registerCtxTool(
     }),
   },
   async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
-    // Security: check each command against deny patterns
-    for (const cmd of commands) {
-      const denied = checkDenyPolicy(cmd.command, "batch_execute");
-      if (denied) return denied;
-    }
-
     try {
       // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
       // The executor denies NODE_OPTIONS in its env (security), so we set it
@@ -2372,11 +2267,10 @@ registerCtxTool(
 
       // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
       // Concurrency>1 switches to a worker pool with per-command timeouts.
-      const effTimeout = resolveExecTimeout(timeout);
       const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
         commands,
         {
-          timeout: effTimeout,
+          timeout: timeout,
           concurrency,
           nodeOptsPrefix,
           cwd,
@@ -2389,18 +2283,18 @@ registerCtxTool(
       const totalLines = stdout.split("\n").length;
 
       if (timedOut && perCommandOutputs.length === 0) {
-        return trackResponse("ctx_batch_execute", {
+        return {
           content: [
             {
               type: "text" as const,
-              text: `Batch timed out after ${effTimeout}ms. No output captured.`,
+              text: `Batch timed out after ${timeout}ms. No output captured.`,
             },
           ],
           isError: true,
-        });
+        };
       }
 
-      // Track indexed bytes (raw data that stays in sandbox)
+      // Track indexed bytes (raw data that stays in the persistent store)
 
       // Index into knowledge base — markdown heading chunking splits by # labels
       const store = getStore();
@@ -2454,12 +2348,12 @@ registerCtxTool(
           : "",
       ].join("\n");
 
-      return trackResponse("ctx_batch_execute", {
+      return {
         content: [{ type: "text" as const, text: output }],
-      });
+      };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_batch_execute", {
+      return {
         content: [
           {
             type: "text" as const,
@@ -2467,7 +2361,7 @@ registerCtxTool(
           },
         ],
         isError: true,
-      });
+      };
     }
   },
 );
@@ -2518,7 +2412,7 @@ registerCtxTool(
     }
 
     lines.push(`[OK] Version: v${VERSION}`);
-    return trackResponse("ctx_doctor", { content: [{ type: "text" as const, text: lines.join("\n") }] });
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   },
 );
 
@@ -2548,7 +2442,7 @@ registerCtxTool(
   },
   async ({ confirm }) => {
     if (!confirm) {
-      return trackResponse("ctx_purge", { content: [{ type: "text" as const, text: "Purge cancelled. Pass confirm: true to proceed." }] });
+      return { content: [{ type: "text" as const, text: "Purge cancelled. Pass confirm: true to proceed." }] };
     }
 
     if (_store) {
@@ -2566,14 +2460,14 @@ registerCtxTool(
       ]);
       let deleted = 0;
       for (const path of paths) if (deleteDbFamily(path)) deleted++;
-      return trackResponse("ctx_purge", {
+      return {
         content: [{ type: "text" as const, text: deleted ? `Purged ${deleted} knowledge-base file set(s).` : "Nothing to purge." }],
-      });
+      };
     } catch (err) {
-      return trackResponse("ctx_purge", {
+      return {
         content: [{ type: "text" as const, text: `Purge failed: ${err instanceof Error ? err.message : err}` }],
         isError: true,
-      });
+      };
     }
   },
 );
@@ -2608,8 +2502,8 @@ async function main() {
 }
 
 // Runs after every registerTool() above, so the SDK's default tools/list handler
-// exists and can be wrapped. Makes ctx_* schemas safe for strict (Gemini
-// function-calling) clients like Antigravity CLI (`agy`) / Gemini CLI.
+// exists and can be wrapped. Keeps ctx_* schemas compatible with strict
+// function-calling clients.
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
