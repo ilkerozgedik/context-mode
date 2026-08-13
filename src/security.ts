@@ -8,8 +8,6 @@ const defaultGlobalSettingsPath = () => resolve(homedir(), ".claude", "settings.
 // Types
 // ==============================================================================
 
-export type PermissionDecision = "allow" | "deny" | "ask";
-
 export interface SecurityPolicy {
   allow: string[];
   deny: string[];
@@ -488,75 +486,6 @@ export function readToolPermissionPatterns(
 // Decision Engine
 // ==============================================================================
 
-interface CommandDecision {
-  decision: PermissionDecision;
-  matchedPattern?: string;
-}
-
-/**
- * Evaluate a command against policies in precedence order.
- *
- * Splits chained commands (&&, ||, ;, |) and checks each segment
- * against deny patterns — prevents bypassing deny by prepending
- * innocent commands like "echo ok && sudo rm -rf /".
- *
- * Within each policy: deny > ask > allow (most restrictive wins).
- * First definitive match across policies wins.
- * Default (no match in any policy): "ask".
- */
-export function evaluateCommand(
-  command: string,
-  policies: SecurityPolicy[],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
-): CommandDecision {
-  // Extract all main segments and nested subshell commands
-  const allCommands = collectCommandElements(command);
-
-  // 1. Deny check: If ANY segment or subshell command is denied, block the entire command
-  for (const cmdElement of allCommands) {
-    for (const policy of policies) {
-      const denyMatch = matchesAnyPattern(cmdElement, policy.deny, caseInsensitive);
-      if (denyMatch) return { decision: "deny", matchedPattern: denyMatch };
-    }
-  }
-
-  // 2. Allow/Ask check: Evaluate segment-by-segment in precedence order.
-  // The command is allowed if and only if EVERY segment and subshell is explicitly allowed.
-  // If any element matches an ask pattern or matches no allow pattern, it defaults to ask.
-  for (const policy of policies) {
-    let allAllowed = true;
-    let anyAsk = false;
-    let matchedAskPattern: string | undefined;
-    let matchedAllowPattern: string | undefined;
-
-    for (const cmdElement of allCommands) {
-      const askMatch = matchesAnyPattern(cmdElement, policy.ask, caseInsensitive);
-      if (askMatch) {
-        anyAsk = true;
-        matchedAskPattern = askMatch;
-        break; // Ask wins immediately within this policy
-      }
-
-      const allowMatch = matchesAnyPattern(cmdElement, policy.allow, caseInsensitive);
-      if (!allowMatch) {
-        allAllowed = false;
-      } else {
-        matchedAllowPattern = allowMatch;
-      }
-    }
-
-    if (anyAsk) {
-      return { decision: "ask", matchedPattern: matchedAskPattern };
-    }
-
-    if (allAllowed && allCommands.length > 0) {
-      return { decision: "allow", matchedPattern: matchedAllowPattern };
-    }
-  }
-
-  return { decision: "ask" };
-}
-
 /**
  * Server-side variant: only enforce deny patterns.
  *
@@ -795,27 +724,6 @@ const SHELL_ESCAPE_PATTERNS: Record<string, RegExp[]> = {
   javascript: [
     /exec(?:Sync|File|FileSync)?\(\s*(['"`])(.*?)\1/g,
     /spawn(?:Sync)?\(\s*(['"`])(.*?)\1/g,
-  ],
-  typescript: [
-    /exec(?:Sync|File|FileSync)?\(\s*(['"`])(.*?)\1/g,
-    /spawn(?:Sync)?\(\s*(['"`])(.*?)\1/g,
-  ],
-  ruby: [
-    /system\(\s*(['"])(.*?)\1/g,
-    /`(.*?)`/g,
-  ],
-  go: [
-    /exec\.Command\(\s*(['"`])(.*?)\1/g,
-  ],
-  php: [
-    /shell_exec\(\s*(['"`])(.*?)\1/g,
-    /(?:^|[^.])exec\(\s*(['"`])(.*?)\1/g,
-    /(?:^|[^.])system\(\s*(['"`])(.*?)\1/g,
-    /passthru\(\s*(['"`])(.*?)\1/g,
-    /proc_open\(\s*(['"`])(.*?)\1/g,
-  ],
-  rust: [
-    /Command::new\(\s*(['"`])(.*?)\1/g,
   ],
 };
 

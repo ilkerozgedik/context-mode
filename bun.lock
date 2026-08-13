@@ -5,7 +5,6 @@
     "": {
       "name": "context-mode",
       "dependencies": {
-        "@mixmark-io/domino": "^2.2.0",
         "better-sqlite3": "^12.6.2",
         "turndown": "^7.2.0",
         "turndown-plugin-gfm": "^1.0.2",
@@ -14,7 +13,6 @@
         "@modelcontextprotocol/sdk": "^1.26.0",
         "@types/better-sqlite3": "^7.6.13",
         "@types/node": "^22.19.11",
-        "@types/turndown": "^5.0.5",
         "esbuild": "^0.27.3",
         "tsx": "^4.21.0",
         "typescript": "^5.7.0",
@@ -139,8 +137,6 @@
     "@types/estree": ["@types/estree@1.0.8", "", {}, "sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w=="],
 
     "@types/node": ["@types/node@22.19.17", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-wGdMcf+vPYM6jikpS/qhg6WiqSV/OhG+jeeHT/KlVqxYfD40iYJf9/AE1uQxVWFvU7MipKRkRv8NSHiCGgPr8Q=="],
-
-    "@types/turndown": ["@types/turndown@5.0.6", "", {}, "sha512-ru00MoyeeouE5BX4gRL+6m/BsDfbRayOskWqUvh7CLGW+UXxHQItqALa38kKnOiZPqJrtzJUgAC2+F0rL1S4Pg=="],
 
     "@vitest/expect": ["@vitest/expect@4.1.5", "", { "dependencies": { "@standard-schema/spec": "^1.1.0", "@types/chai": "^5.2.2", "@vitest/spy": "4.1.5", "@vitest/utils": "4.1.5", "chai": "^6.2.2", "tinyrainbow": "^3.1.0" } }, "sha512-PWBaRY5JoKuRnHlUHfpV/KohFylaDZTupcXN1H9vYryNLOnitSw60Mw9IAE2r67NbwwzBw/Cc/8q9BK3kIX8Kw=="],
 

@@ -37,8 +37,6 @@ type SearchRow = {
   label: string;
   rank: number;
   highlighted: string;
-  /** Attribution session_id (empty string for legacy unattributed chunks). */
-  session_id: string;
 };
 
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
@@ -172,46 +170,6 @@ const WHITESPACE_BREAK_RATIO = 0.5;
 // ─────────────────────────────────────────────────────────
 // ContentStore
 // ─────────────────────────────────────────────────────────
-
-/**
- * Remove stale DB files from previous sessions whose processes no longer exist.
- */
-export function cleanupStaleDBs(): number {
-  const dir = tmpdir();
-  let cleaned = 0;
-  try {
-    const files = readdirSync(dir);
-    for (const file of files) {
-      const match = file.match(/^context-mode-(\d+)\.db$/);
-      if (!match) continue;
-      const pid = parseInt(match[1], 10);
-      if (pid === process.pid) continue;
-      try {
-        process.kill(pid, 0);
-      } catch {
-        const base = join(dir, file);
-        for (const suffix of ["", "-wal", "-shm"]) {
-          try { unlinkSync(base + suffix); } catch { /* ignore */ }
-        }
-        cleaned++;
-      }
-    }
-  } catch { /* ignore readdir errors */ }
-  return cleaned;
-}
-
-/**
- * Check if a PID is still alive (not a zombie holding a WAL lock).
- * Returns true if the process exists, false if it's dead.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Clean up stale per-project content store DBs older than maxAgeDays.
@@ -391,7 +349,6 @@ export class ContentStore {
   #stmtSearchTrigramExactContentType!: PreparedStatement;
 
   // Read path
-  #stmtListSources!: PreparedStatement;
   #stmtChunksBySource!: PreparedStatement;
   #stmtSourceChunkCount!: PreparedStatement;
   #stmtChunkContent!: PreparedStatement;
@@ -478,8 +435,6 @@ export class ContentStore {
         source_id UNINDEXED,
         content_type UNINDEXED,
         source_category UNINDEXED,
-        session_id UNINDEXED,
-        event_id UNINDEXED,
         timestamp UNINDEXED,
         tokenize='porter unicode61'
       );
@@ -490,8 +445,6 @@ export class ContentStore {
         source_id UNINDEXED,
         content_type UNINDEXED,
         source_category UNINDEXED,
-        session_id UNINDEXED,
-        event_id UNINDEXED,
         timestamp UNINDEXED,
         tokenize='trigram'
       );
@@ -503,7 +456,7 @@ export class ContentStore {
       CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
     `);
 
-    // FTS5 schema migration: old schema (4 cols) → new schema (8 cols).
+    // FTS5 schema migration: old schema (4 cols) → current schema.
     // FTS5 virtual tables do not support ALTER TABLE ADD COLUMN, so we must
     // DROP + re-CREATE. Detection: check for sentinel column `source_category`
     // via pragma_table_xinfo. Three states:
@@ -526,8 +479,6 @@ export class ContentStore {
             source_id UNINDEXED,
             content_type UNINDEXED,
             source_category UNINDEXED,
-            session_id UNINDEXED,
-            event_id UNINDEXED,
             timestamp UNINDEXED,
             tokenize='porter unicode61'
           );
@@ -537,8 +488,6 @@ export class ContentStore {
             source_id UNINDEXED,
             content_type UNINDEXED,
             source_category UNINDEXED,
-            session_id UNINDEXED,
-            event_id UNINDEXED,
             timestamp UNINDEXED,
             tokenize='trigram'
           );
@@ -560,10 +509,10 @@ export class ContentStore {
       "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunk = this.#db.prepare(
-      "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO chunks (title, content, source_id, content_type, source_category, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunkTrigram = this.#db.prepare(
-      "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertVocab = this.#db.prepare(
       "INSERT OR IGNORE INTO vocabulary (word) VALUES (?)",
@@ -590,8 +539,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ?
@@ -606,8 +554,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
@@ -622,8 +569,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ?
@@ -638,8 +584,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ?
@@ -654,8 +599,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
@@ -670,8 +614,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ?
@@ -688,8 +631,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND chunks.content_type = ?
@@ -704,8 +646,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
@@ -720,8 +661,7 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted,
-        chunks.session_id
+        highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ? AND chunks.content_type = ?
@@ -736,8 +676,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND chunks_trigram.content_type = ?
@@ -752,8 +691,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
@@ -768,8 +706,7 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
-        chunks_trigram.session_id
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ? AND chunks_trigram.content_type = ?
@@ -783,9 +720,6 @@ export class ContentStore {
     );
 
     // Read path
-    this.#stmtListSources = this.#db.prepare(
-      "SELECT label, chunk_count as chunkCount FROM sources ORDER BY id DESC",
-    );
     this.#stmtChunksBySource = this.#db.prepare(
       `SELECT c.title, c.content, c.content_type, s.label
        FROM chunks c
@@ -839,14 +773,8 @@ export class ContentStore {
     content?: string;
     path?: string;
     source?: string;
-    /**
-     * Optional FK metadata recorded on each indexed chunk so per-session
-     * honest-savings stats can join chunks → session_events. When omitted,
-     * chunks fall back to empty-string columns (legacy behaviour).
-     */
-    attribution?: { sessionId?: string; eventId?: string };
   }): IndexResult {
-    const { content, path, source, attribution } = options;
+    const { content, path, source } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -889,7 +817,7 @@ export class ContentStore {
     const filePath = path ?? undefined;
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash));
   }
 
   // ── Index Directory (#687) ──
@@ -901,12 +829,10 @@ export class ContentStore {
    * for every file — directory support never bypasses the TOCTOU defense
    * from #442 round-3.
    *
-   * Reported by @matiasduartee in #687.
    */
   indexDirectory(opts: {
     path: string;
     source?: string;
-    attribution?: { sessionId?: string; eventId?: string };
     /** Optional per-file deny check — runs INSIDE the walk loop so a denied
      *  file does not even open a fd. Returns true to deny. */
     perFileDeny?: (absPath: string) => boolean;
@@ -919,7 +845,7 @@ export class ContentStore {
     failed: number;
     label: string;
   } {
-    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const { path: rootPath, source, perFileDeny, ...walkOpts } = opts;
     const walked = walkDirectoryDetailed(rootPath, walkOpts);
 
     let filesIndexed = 0;
@@ -935,7 +861,7 @@ export class ContentStore {
       try {
         // Per-file source label so ctx_search(source: "<file>") still works.
         const fileSource = source ? `${source}:${file}` : file;
-        const r = this.index({ path: file, source: fileSource, attribution });
+        const r = this.index({ path: file, source: fileSource });
         filesIndexed++;
         totalChunks += r.totalChunks;
       } catch {
@@ -967,11 +893,10 @@ export class ContentStore {
     content: string,
     source: string,
     linesPerChunk: number = 20,
-    attribution?: { sessionId?: string; eventId?: string },
     maxChunkBytes: number = MAX_CHUNK_BYTES,
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "", undefined, undefined, attribution);
+      return this.#insertChunks([], source, "");
     }
 
     const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
@@ -982,7 +907,6 @@ export class ContentStore {
       content,
       undefined,
       undefined,
-      attribution,
     ));
   }
 
@@ -999,27 +923,26 @@ export class ContentStore {
     content: string,
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
-    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText("", source, undefined, maxChunkBytes);
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText(content, source, undefined, maxChunkBytes);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText(content, source, undefined, maxChunkBytes);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
+    return withRetry(() => this.#insertChunks(chunks, source, content));
   }
 
   // ── Shared DB Insertion ──
@@ -1035,13 +958,8 @@ export class ContentStore {
     text: string,
     filePath?: string,
     contentHash?: string,
-    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
-    // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
-    // "not-null but unattributed" sentinel used by legacy rows.
-    const sessionIdCol = attribution?.sessionId ?? "";
-    const eventIdCol = attribution?.eventId ?? "";
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -1062,8 +980,8 @@ export class ContentStore {
       const now = new Date().toISOString();
       for (const chunk of chunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, now);
+        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, now);
       }
 
       return sourceId;
@@ -1100,7 +1018,6 @@ export class ContentStore {
       contentType: r.content_type as "code" | "prose",
       highlighted: r.highlighted,
       timestamp: r.timestamp ?? undefined,
-      sessionId: r.session_id ?? "",
     }));
   }
 
@@ -1343,24 +1260,12 @@ export class ContentStore {
     source?: string,
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
-    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
-    // Step 0: Auto-refresh stale file-backed sources before searching
     this.#refreshStaleSources();
 
-    // When a session-id allow-set is in play (issue #737 project filter),
-    // fetch a larger candidate pool from the FTS5 layers so the post-filter
-    // can still deliver `limit` matches even if many candidates are excluded.
-    // The cap is bounded — even at the largest installs the chunk count
-    // dwarfs `limit * 8`, and the surplus is dropped on the post-filter.
-    const fetchLimit = sessionIdAllowSet ? Math.max(limit * 8, 40) : limit;
-    const sessionFilter = this.#makeSessionFilter(sessionIdAllowSet);
-
-    // Step 1: RRF fusion (porter OR + trigram OR → merge)
-    const rrfResults = this.#rrfSearch(query, fetchLimit, source, contentType, sourceMatchMode);
-    const rrfFiltered = sessionFilter ? rrfResults.filter(sessionFilter) : rrfResults;
-    if (rrfFiltered.length > 0) {
-      const reranked = this.#applyProximityReranking(rrfFiltered.slice(0, limit), query);
+    const rrfResults = this.#rrfSearch(query, limit, source, contentType, sourceMatchMode);
+    if (rrfResults.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfResults, query);
       return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
@@ -1377,31 +1282,14 @@ export class ContentStore {
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.#rrfSearch(correctedQuery, fetchLimit, source, contentType, sourceMatchMode);
-      const fuzzyFiltered = sessionFilter ? fuzzyResults.filter(sessionFilter) : fuzzyResults;
-      if (fuzzyFiltered.length > 0) {
-        const reranked = this.#applyProximityReranking(fuzzyFiltered.slice(0, limit), correctedQuery);
+      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
+      if (fuzzyResults.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
 
     return [];
-  }
-
-  /**
-   * Build the session-id post-filter for the FTS5 candidate pool. Legacy
-   * chunks indexed before per-session attribution carry `session_id=''` and
-   * stay visible across projects so user-indexed content remains reachable
-   * after opting into the shared-DB mode (#737).
-   */
-  #makeSessionFilter(
-    allowSet: Set<string> | undefined,
-  ): ((r: SearchResult) => boolean) | null {
-    if (!allowSet) return null;
-    return (r: SearchResult) => {
-      const sid = r.sessionId ?? "";
-      return sid === "" || allowSet.has(sid);
-    };
   }
 
   /** Number of sources auto-refreshed in the last searchWithFallback call. */
@@ -1464,34 +1352,6 @@ export class ContentStore {
     const row = this.#stmtSourceMeta.get(label) as { label: string; chunk_count: number; code_chunk_count: number; indexed_at: string; file_path: string | null; content_hash: string | null } | undefined;
     if (!row) return null;
     return { label: row.label, chunkCount: row.chunk_count, codeChunkCount: row.code_chunk_count, indexedAt: row.indexed_at, filePath: row.file_path ?? null, contentHash: row.content_hash ?? null };
-  }
-
-  listSources(): Array<{ label: string; chunkCount: number }> {
-    return this.#stmtListSources.all() as Array<{
-      label: string;
-      chunkCount: number;
-    }>;
-  }
-
-  /**
-   * Aggregate snapshot of the persistent content store. Returns total
-   * chunk count, source count, and the most recent indexed_at timestamp.
-   * Exposes index state for diagnostics.
-   * round trip instead of inferring it from snapshot diffs.
-   */
-  getIndexState(): { totalChunks: number; totalSources: number; lastIndexedAt?: string } {
-    const row = (this.#db
-      .prepare("SELECT COALESCE(SUM(chunk_count), 0) AS total_chunks, COUNT(*) AS total_sources, MAX(indexed_at) AS last_indexed_at FROM sources")
-      .get() as {
-        total_chunks: number;
-        total_sources: number;
-        last_indexed_at: string | null;
-      });
-    return {
-      totalChunks: row.total_chunks ?? 0,
-      totalSources: row.total_sources ?? 0,
-      lastIndexedAt: row.last_indexed_at ?? undefined,
-    };
   }
 
   /**
@@ -1593,15 +1453,6 @@ export class ContentStore {
     });
     const info = cleanup(maxAgeDays);
     return info.changes;
-  }
-
-  /** Get DB file size in bytes. */
-  getDBSizeBytes(): number {
-    try {
-      return statSync(this.#dbPath).size;
-    } catch {
-      return 0;
-    }
   }
 
   /** Merge FTS5 b-tree segments for both porter and trigram indexes. */

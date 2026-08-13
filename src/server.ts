@@ -2,16 +2,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { accessSync, constants, existsSync, mkdirSync, renameSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { homedir, tmpdir, cpus, platform } from "node:os";
+import { homedir, tmpdir, cpus } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type IndexResult } from "./store.js";
-import { composeFetchCacheKey } from "./fetch-cache.js";
+import { ContentStore, cleanupStaleContentDBs, type IndexResult } from "./store.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
@@ -28,25 +28,6 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { charSafePrefix } from "./truncate.js";
-import {
-  ensureWritableStorageDir,
-  formatStorageDirectoryError,
-  hashProjectDirLegacy,
-  resolveContentStorePath,
-  resolveContentStorageDir,
-  resolveSessionDbPath,
-  resolveSessionStorageDir,
-  SessionDB,
-  StorageDirectoryError,
-} from "./session/db.js";
-import { purgeSession } from "./session/purge.js";
-import { searchAllSources } from "./search/unified.js";
-import {
-  buildCtxSearchInputSchema,
-  CTX_SEARCH_SHARED_MODE,
-  resolveProjectScope,
-} from "./search/ctx-search-schema.js";
-import { FloodGuard } from "./search/flood-guard.js";
 import { loadDatabase } from "./db-base.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
@@ -89,20 +70,11 @@ function registerCtxTool(
   config: Record<string, unknown>,
   handler: (toolArgs: any) => Promise<any> | any,
 ): unknown {
-  const wrappedHandler = async (toolArgs: any) => {
-    try {
-      return await handler(toolArgs);
-    } catch (err) {
-      const result = storageErrorResult(err);
-      if (result) return result;
-      throw err;
-    }
-  };
-  REGISTERED_CTX_TOOLS.push({ name, config, handler: wrappedHandler });
-  return (sdkRegisterTool as any)(name, config, wrappedHandler);
+  REGISTERED_CTX_TOOLS.push({ name, config, handler });
+  return (sdkRegisterTool as any)(name, config, handler);
 }
 
-type ToolContextOverride = { projectDir: string; sessionId?: string };
+type ToolContextOverride = { projectDir: string };
 const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
 
 export async function withProjectDirOverride<T>(
@@ -135,27 +107,7 @@ process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best ef
 // Lazy singleton — no DB overhead unless index/search is used
 let _store: ContentStore | null = null;
 
-/**
- * Build the FK-attribution object passed to every ContentStore.index*() call
- * in this process. CLAUDE_SESSION_ID is the only MCP-side handle we have on
- * the current session — eventId stays undefined because MCP tool invocations
- * are not paired with PostToolUse event rows at index time (the hook fires
- * AFTER the tool returns). Empty-string fallback inside #insertChunks keeps
- * legacy unattributed rows readable.
- */
-export function currentAttribution(): { sessionId?: string } | undefined {
-  const override = projectDirOverride.getStore();
-  const sessionId = override?.sessionId ?? process.env.CONTEXT_MODE_SESSION_ID?.trim();
-  return sessionId ? { sessionId } : undefined;
-}
-
-function getDefaultSessionDir(): string {
-  return join(homedir(), ".claude", "context-mode", "sessions");
-}
-
-function getSessionDir(): string {
-  return ensureWritableStorageDir(resolveSessionStorageDir(getDefaultSessionDir));
-}
+const DEFAULT_CONTENT_DIR = join(homedir(), ".claude", "context-mode", "content");
 
 export function getProjectDir(): string {
   const override = projectDirOverride.getStore();
@@ -167,42 +119,48 @@ function resolveProjectPath(filePath: string): string {
   return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
 
-/**
- * Resolve the per-project SessionDB path. Delegates to
- * {@link resolveSessionDbPath} so casing-only variants of the same
- * physical worktree on macOS / Windows hit ONE DB, not two — and any
- * pre-existing legacy raw-casing DB gets migrated in place on first
- * resolve. Linux is a no-op.
- */
-function getSessionDbPath(): string {
-  return resolveSessionDbPath({
-    projectDir: getProjectDir(),
-    sessionsDir: getSessionDir(),
-  });
+function getContentDir(): string {
+  const root = process.env.CONTEXT_MODE_DIR?.trim();
+  if (root && !isAbsolute(root)) throw new Error("CONTEXT_MODE_DIR must be an absolute path.");
+  const dir = root ? join(resolve(root), "content") : DEFAULT_CONTENT_DIR;
+  mkdirSync(dir, { recursive: true });
+  accessSync(dir, constants.W_OK);
+  return dir;
 }
 
-/**
- * Compute a per-project, per-platform persistent path for the ContentStore.
- * Derives content dir from the adapter's session dir so each platform
- * has its own isolated FTS5 DB — no cross-platform data sharing.
- *
- * Layout: ~/<configDir>/context-mode/content/<hash>.db
- *   e.g.  ~/.claude/context-mode/content/87c28c41ddb64d38.db
- *         ~/.cursor/context-mode/content/87c28c41ddb64d38.db
- */
+function normalizeProjectPath(projectDir: string): string {
+  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  return process.platform === "darwin" || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function projectHash(projectDir: string, canonical = true): string {
+  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  const value = canonical ? normalizeProjectPath(projectDir) : normalized;
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
 function getStorePath(): string {
-  const dir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
-  // Delegate to resolveContentStorePath: same case-fold + one-shot legacy
-  // rename behavior as resolveSessionDbPath. On macOS / Windows, an
-  // existing legacy raw-casing FTS5 db (with -wal/-shm sidecars) is
-  // migrated in place on first call. On Linux it's a no-op.
-  return resolveContentStorePath({ projectDir: getProjectDir(), contentDir: dir });
+  const dir = getContentDir();
+  const projectDir = getProjectDir();
+  const canonicalPath = join(dir, `${projectHash(projectDir)}.db`);
+  if (existsSync(canonicalPath)) return canonicalPath;
+
+  const legacyPath = join(dir, `${projectHash(projectDir, false)}.db`);
+  if (legacyPath !== canonicalPath && existsSync(legacyPath)) {
+    try {
+      renameSync(legacyPath, canonicalPath);
+      for (const suffix of ["-wal", "-shm"]) {
+        try { renameSync(legacyPath + suffix, canonicalPath + suffix); } catch {}
+      }
+    } catch {}
+  }
+  return canonicalPath;
 }
 
 function getStore(): ContentStore {
   if (!_store) {
-    // Content DB cleanup on fresh start is handled by SessionStart hook.
-    // Server just opens whatever DB exists (or creates new if hook deleted it).
     const dbPath = getStorePath();
     _store = new ContentStore(dbPath);
 
@@ -236,8 +194,6 @@ function getStore(): ContentStore {
       if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
     } catch { /* best-effort */ }
 
-    // Also clean old PID-based DBs from migration
-    cleanupStaleDBs();
   }
   return _store;
 }
@@ -246,11 +202,6 @@ type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
 };
-
-function storageErrorResult(err: unknown): ToolResult | null {
-  if (!(err instanceof StorageDirectoryError)) return null;
-  return { content: [{ type: "text", text: formatStorageDirectoryError(err) }], isError: true };
-}
 
 function trackResponse(_toolName: string, response: ToolResult): ToolResult {
   return response;
@@ -434,11 +385,6 @@ export function positionsFromHighlight(highlighted: string): number[] {
   }
 
   return positions;
-}
-
-/** Strip STX/ETX markers to recover original content. */
-function stripMarkers(highlighted: string): string {
-  return highlighted.replaceAll(STX, "").replaceAll(ETX, "");
 }
 
 export function extractSnippet(
@@ -797,20 +743,7 @@ registerCtxTool(
     description: "Run code in a sandbox to process large or unpredictable output. Print only the findings that should enter context; use ctx_batch_execute for multiple related commands.",
     inputSchema: z.object({
       language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-          "csharp",
-        ])
+.enum(["javascript", "python", "shell"])
         .describe("Runtime language"),
       code: z
         .string()
@@ -819,13 +752,8 @@ registerCtxTool(
         .coerce.number()
         .optional()
         .describe("Max execution time in ms; omit to use the MCP host timeout."),
-      // background: wrapped in coerceBoolean preprocessor so the literal
-      // strings "true"/"false" arriving from OpenCode's native plugin
-      // bridge (and several LLM providers' tool-call JSON) parse as the
-      // boolean the handler expects. z.coerce.boolean() is unsafe here —
-      // Boolean("false") is true. Fixes #627.
       background: z
-        .preprocess(coerceBoolean, z.boolean())
+        .boolean()
         .optional()
         .default(false)
         .describe("Keep the process running after timeout for servers or daemons."),
@@ -850,9 +778,9 @@ registerCtxTool(
     }
 
     try {
-      // For JS/TS: wrap in async IIFE with fetch + http/https interceptors to track network bytes
+      // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
-      if (language === "javascript" || language === "typescript") {
+      if (language === "javascript") {
         // Wrap user code in a closure that shadows CJS require with http/https interceptor.
         // globalThis.require does NOT work because CJS require is module-scoped, not global.
         // The closure approach (function(__cm_req){ var require=...; })(require) correctly
@@ -1054,7 +982,7 @@ function indexStdout(
   source: string,
 ): { content: Array<{ type: "text"; text: string }> } {
   const store = getStore();
-  const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+  const indexed = store.index({ content: stdout, source });
   return {
     content: [
       {
@@ -1083,7 +1011,7 @@ function intentSearch(
 
   // Index into the PERSISTENT store so user can ctx_search() later
   const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source, undefined, currentAttribution());
+  const indexed = persistent.indexPlainText(stdout, source, undefined);
 
   // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
@@ -1152,20 +1080,7 @@ registerCtxTool(
         .string()
         .describe("Absolute file path or relative to project root"),
       language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-          "csharp",
-        ])
+.enum(["javascript", "python", "shell"])
         .describe("Runtime language"),
       code: z
         .string()
@@ -1423,7 +1338,6 @@ registerCtxTool(
         const dirResult = store.indexDirectory({
           path: resolvedPath,
           source: source ?? resolvedPath,
-          attribution: currentAttribution(),
           perFileDeny,
           include,
           exclude,
@@ -1453,7 +1367,7 @@ registerCtxTool(
       }
 
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath, attribution: currentAttribution() });
+      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
 
       return trackResponse("ctx_index", {
         content: [
@@ -1479,12 +1393,6 @@ registerCtxTool(
 // Tool: search — progressive throttling
 // ─────────────────────────────────────────────────────────
 
-// Track search calls per N-second window for progressive throttling.
-// Defaults preserve the historical behavior (60s window, soft-cap at 3
-// calls, hard-block at 8). All three thresholds are overridable via env
-// vars so users can loosen or tighten the policy without forking. Invalid
-// values (non-positive numbers, NaN) fall back to the default to avoid
-// silently disabling the protection.
 function readPositiveEnv(name: string, defaultValue: number): number {
   const raw = process.env[name];
   if (!raw) return defaultValue;
@@ -1493,323 +1401,95 @@ function readPositiveEnv(name: string, defaultValue: number): number {
 }
 
 const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
-const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
-const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
+const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3);
+const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8);
+let searchWindowStart = 0;
+let searchCallCount = 0;
 
-// #769: progressive throttle bucketed PER agent-context, not machine-global.
-// Concurrent subagents share ONE MCP server process; a single global counter
-// summed their independent searches into one budget and hard-blocked
-// legitimate parallel fan-out. The guard keys each actor's window separately
-// so single-actor flood protection is preserved while fan-out is not starved.
-const searchFloodGuard = new FloodGuard({
-  windowMs: SEARCH_WINDOW_MS,
-  softCapAfter: SEARCH_MAX_RESULTS_AFTER,
-  blockAfter: SEARCH_BLOCK_AFTER,
-});
-
-/**
- * Per-agent flood-guard key. Each concurrent subagent in a Claude Code
- * Task/Workflow fan-out runs under its own session id (written to SessionDB
- * via hooks), so currentAttribution().sessionId is the per-agent discriminator
- * already available MCP-side. Falls back to a single shared bucket when no
- * identity is resolvable (preserves today's single-threaded behaviour).
- */
-function searchFloodGuardKey(): string {
-  try {
-    return currentAttribution()?.sessionId ?? "__default__";
-  } catch {
-    return "__default__";
+function recordSearch(now: number): { count: number; windowStart: number; blocked: boolean; softCapped: boolean } {
+  if (!searchWindowStart || now - searchWindowStart > SEARCH_WINDOW_MS) {
+    searchWindowStart = now;
+    searchCallCount = 0;
   }
-}
-
-/**
- * Defensive coercion: parse stringified JSON arrays, AND lift a bare
- * non-empty string into a single-element array.
- *
- * Two shapes show up from the wild:
- *   1. `"[\"a\",\"b\"]"` — Claude Code double-serialization bug
- *      (https://github.com/anthropics/claude-code/issues/34520).
- *   2. `"single query"` — some LLM providers / OpenCode's native plugin
- *      bridge deliver a single string when the schema expects `string[]`
- *      (issue #627). v1.0.139 (#621) made the bridge run the Zod schema,
- *      so this now surfaces as `Expected array, received string`. The
- *      ergonomic recovery is to treat it as `["single query"]`.
- *
- * An empty string is intentionally NOT lifted — empty input should still
- * fail Zod's `.min(1)` check rather than masquerade as `[""]`.
- */
-function coerceJsonArray(val: unknown): unknown {
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-    if (trimmed.length === 0) return val; // let zod produce "non-empty" error
-    try {
-      const parsed = JSON.parse(val);
-      if (Array.isArray(parsed)) return parsed;
-    } catch { /* fall through — not JSON, treat as bare-string lift */ }
-    // Bare-string lift (#627): single query delivered as a plain string.
-    return [val];
-  }
-  return val;
-}
-
-/**
- * Defensive coercion: accept the string literals "true"/"false" as
- * booleans. The OpenCode native plugin bridge (and several LLM providers'
- * tool-call JSON) stringifies primitives — `background:"false"` instead
- * of `background:false`, `confirm:"true"` instead of `confirm:true`.
- *
- * We deliberately do NOT use `z.coerce.boolean()` for boolean fields:
- * `Boolean("false")` is `true`, so Zod's coerce path silently flips the
- * meaning. This helper recognises only the documented literal forms and
- * passes anything else through untouched so Zod surfaces the right error.
- *
- * Fixes #627.
- */
-function coerceBoolean(val: unknown): unknown {
-  if (typeof val === "string") {
-    const t = val.trim().toLowerCase();
-    if (t === "true") return true;
-    if (t === "false") return false;
-  }
-  return val;
-}
-
-/**
- * Coerce commands array: handles double-serialization AND the case where
- * the model passes plain command strings instead of {label, command} objects.
- */
-function coerceCommandsArray(val: unknown): unknown {
-  const arr = coerceJsonArray(val);
-  if (Array.isArray(arr)) {
-    return arr.map((item, i) =>
-      typeof item === "string" ? { label: `cmd_${i + 1}`, command: item } : item
-    );
-  }
-  return arr;
+  searchCallCount++;
+  return {
+    count: searchCallCount,
+    windowStart: searchWindowStart,
+    blocked: searchCallCount > SEARCH_BLOCK_AFTER,
+    softCapped: searchCallCount > SEARCH_MAX_RESULTS_AFTER,
+  };
 }
 
 registerCtxTool(
   "ctx_search",
   {
     title: "Search Indexed Content",
-    // #846: read-only query over the local FTS5 store. No mutation, no network.
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    description: "Search indexed content and session memory. Batch related questions in queries; use source or timeline to narrow retrieval.",
-    inputSchema: buildCtxSearchInputSchema(CTX_SEARCH_SHARED_MODE),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    description: "Search indexed content. Batch related questions in queries; use source to narrow retrieval.",
+    inputSchema: z.object({
+      queries: z.array(z.string()).min(1).describe("Array of search queries. Batch ALL questions in one call."),
+      limit: z.coerce.number().optional().default(3).describe("Results per query (default: 3)"),
+      source: z.string().optional().describe("Filter to a specific indexed source (partial match)."),
+      contentType: z.enum(["code", "prose"]).optional().describe("Filter results by content type: 'code' or 'prose'."),
+    }),
   },
-  async (params) => {
+  async ({ queries, limit = 3, source, contentType }) => {
     try {
       const store = getStore();
-      const sort = (params as Record<string, unknown>).sort as string || "relevance";
-
-      // Guard: redirect when the index is empty — ctx_search is a follow-up
-      // tool that requires prior indexing. Skip for timeline mode (SessionDB may have data).
-      if (sort !== "timeline" && store.getStats().chunks === 0) {
+      if (store.getStats().chunks === 0) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
-            text: "Knowledge base is empty — no content has been indexed yet.\n\n" +
-              "ctx_search is a follow-up tool that queries previously indexed content. " +
-              "To gather and index content first, use:\n" +
-              "  • ctx_batch_execute(commands, queries) — run commands, auto-index output, and search in one call\n" +
-              "  • ctx_fetch_and_index(url) — fetch a URL, index it, then search with ctx_search\n" +
-              "  • ctx_index(content, source) — manually index text content\n\n" +
-              "After indexing, ctx_search becomes available for follow-up queries.",
+            text: "Knowledge base is empty — index content first with ctx_batch_execute, ctx_fetch_and_index, or ctx_index.",
           }],
           isError: true,
         });
       }
 
-      const raw = params as Record<string, unknown>;
-
-      // Normalize: accept both query (string) and queries (array)
-      const queryList: string[] = [];
-      if (Array.isArray(raw.queries) && raw.queries.length > 0) {
-        queryList.push(...(raw.queries as string[]));
-      } else if (typeof raw.query === "string" && raw.query.length > 0) {
-        queryList.push(raw.query as string);
-      }
-
-      if (queryList.length === 0) {
-        return trackResponse("ctx_search", {
-          content: [{ type: "text" as const, text: "Error: provide query or queries." }],
-          isError: true,
-        });
-      }
-
-      const { limit = 3, source, contentType, project } = params as {
-        limit?: number;
-        source?: string;
-        contentType?: "code" | "prose";
-        project?: string;
-      };
-
-      // Resolve the per-project scope (#737). When shared-DB mode is off the
-      // resolver returns `undefined` and `project` is silently ignored — the
-      // per-project DB is naturally isolated by directory hash, so there is
-      // nothing for an in-process filter to do.
-      const projectScope = resolveProjectScope(
-        project,
-        CTX_SEARCH_SHARED_MODE,
-        () => getProjectDir(),
-      );
-
-      // Progressive throttling: track calls per agent-context window (#769).
       const now = Date.now();
-      const flood = searchFloodGuard.record(searchFloodGuardKey(), now);
-      const searchCallCount = flood.count;
-
-      // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
+      const flood = recordSearch(now);
       if (flood.blocked) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
-              "You're flooding context. STOP making individual search calls. " +
-              "Use ctx_batch_execute(commands, queries) for your next research step.",
+            text: `BLOCKED: ${flood.count} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. Batch queries or use ctx_batch_execute.`,
           }],
           isError: true,
         });
       }
 
-      // Determine per-query result limit based on throttle level
-      const effectiveLimit = flood.softCapped
-        ? 1 // after soft cap: only 1 result per query
-        : Math.min(limit, 2); // normal: max 2
-
-      const MAX_TOTAL = 40 * 1024; // 40KB total cap
-      let totalSize = 0;
+      const effectiveLimit = flood.softCapped ? 1 : Math.min(limit, 2);
       const sections: string[] = [];
+      let totalSize = 0;
+      const MAX_TOTAL = 40 * 1024;
 
-      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query).
-      // Issue #737: also open in relevance mode when a string `projectScope`
-      // is in play — the 2-step IN-clause needs SessionDB to translate
-      // `project_dir` → allow-set of session ids for the ContentStore filter.
-      let timelineDB: InstanceType<typeof SessionDB> | null = null;
-      const needsSessionDB = sort === "timeline" || typeof projectScope === "string";
-      if (needsSessionDB) {
-        try {
-          const sessionsDir = getSessionDir();
-          const projectDir = getProjectDir();
-          const dbFile = resolveSessionDbPath({ projectDir, sessionsDir });
-          if (existsSync(dbFile)) {
-            timelineDB = new SessionDB({ dbPath: dbFile });
-          }
-        } catch { /* SessionDB unavailable — search ContentStore only */ }
-      }
-
-      // Resolve the session-id allow-set once for the relevance-mode path —
-      // searchAllSources resolves its own copy for timeline mode. Empty set
-      // is preserved (means "no events for this project"), which surfaces
-      // only legacy `session_id=''` chunks via the post-filter.
-      let relevanceAllowSet: Set<string> | undefined;
-      if (typeof projectScope === "string" && timelineDB) {
-        try {
-          relevanceAllowSet = new Set(timelineDB.getSessionIdsForProject(projectScope));
-        } catch { /* best-effort */ }
-      }
-
-      try {
-      for (const q of queryList) {
+      for (const q of queries) {
         if (totalSize > MAX_TOTAL) {
-          sections.push(`## ${q}\n(output cap reached)\n`);
+          sections.push(`## ${q}\n(output cap reached)`);
           continue;
         }
-
-        let results;
-        if (sort === "timeline") {
-          results = searchAllSources({
-            query: q,
-            limit: effectiveLimit,
-            store,
-            sort,
-            source,
-            contentType,
-            sessionDB: timelineDB,
-            projectDir: getProjectDir(),
-            projectScope,
-          });
-        } else {
-          results = store.searchWithFallback(
-            q,
-            effectiveLimit,
-            source,
-            contentType,
-            "like",
-            relevanceAllowSet,
-          );
-        }
-
+        const results = store.searchWithFallback(q, effectiveLimit, source, contentType);
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
           continue;
         }
-
-        const formatted = results
-          .map((r, i) => {
-            const origin = (r as any).origin || "current-session";
-            const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
-            const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
-            const heading = `### ${r.title}`;
-            const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
-            return `${header}\n${heading}\n\n${snippet}`;
-          })
-          .join("\n\n");
-
+        const formatted = results.map((r) => {
+          const ts = r.timestamp ? r.timestamp.slice(0, 16).replace("T", " ") : "";
+          const header = `--- [${r.source}${ts ? " | " + ts : ""}] ---`;
+          return `${header}\n### ${r.title}\n\n${extractSnippet(r.content, q, 1500, r.highlighted)}`;
+        }).join("\n\n");
         sections.push(`## ${q}\n\n${formatted}`);
         totalSize += formatted.length;
       }
-      } finally {
-        try { timelineDB?.close(); } catch {}
-      }
 
       let output = sections.join("\n\n---\n\n");
-
-      // Report auto-refreshed stale sources
       if (store.lastRefreshCount > 0) {
-        output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
+        output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""}.\n\n${output}`;
       }
-
-      // Throttle counter — always surfaced so agents can pace themselves
-      // proactively instead of discovering the limit only after results are
-      // already truncated. Soft warning after SEARCH_MAX_RESULTS_AFTER calls;
-      // gentle informational line before that.
-      const throttleRemaining = Math.max(0, SEARCH_BLOCK_AFTER - searchCallCount);
-      const softCapRemaining = Math.max(0, SEARCH_MAX_RESULTS_AFTER - searchCallCount);
-      if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
-        output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `Results limited to ${effectiveLimit}/query. ${throttleRemaining} call(s) remaining before block. ` +
-          `Batch queries: ctx_search(queries: ["q1","q2","q3"]) or use ctx_batch_execute.`;
-      } else {
-        output += `\n\n> Throttle: call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `${softCapRemaining} call(s) before soft cap. ` +
-          `Prefer ctx_search(queries: [...]) array form for multi-query workloads — it counts as a single call.`;
-      }
-
-      if (output.trim().length === 0) {
-        const sources = store.listSources();
-        const sourceList = sources.length > 0
-          ? `\nIndexed sources: ${sources.map((s) => `"${s.label}" (${s.chunkCount} sections)`).join(", ")}`
-          : "";
-        return trackResponse("ctx_search", {
-          content: [{ type: "text" as const, text: `No results found.${sourceList}` }],
-        });
-      }
-
-      return trackResponse("ctx_search", {
-        content: [{ type: "text" as const, text: output }],
-      });
+      return trackResponse("ctx_search", { content: [{ type: "text" as const, text: output }] });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_search", {
-        content: [{ type: "text" as const, text: `Search error: ${message}` }],
-        isError: true,
-      });
+      return trackResponse("ctx_search", { content: [{ type: "text" as const, text: `Search error: ${message}` }], isError: true });
     }
   },
 );
@@ -2223,7 +1903,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
     // a sandbox that blocks outbound network, OR a transient upstream DNS
     // hiccup. Append an imperative retry hint so the agent does not capitulate
     // to training data on the FIRST transient failure (PR #654 substitute —
-    // sibling-tool consistency with hooks/core/routing.mjs WebFetch wording).
+    // Keep fetch error wording consistent across call sites.
     const errCode = (err as NodeJS.ErrnoException | undefined)?.code ?? "";
     const isTransientDns = errCode === "ETIMEOUT" || errCode === "ETIMEDOUT" ||
       errCode === "EAI_AGAIN" || errCode === "ENETUNREACH" || errCode === "EPERM";
@@ -2306,7 +1986,7 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
     // Cache key composes (source, url) so two distinct URLs sharing the same
     // `source` label do not collide — they each get their own cache slot
     // (commit 1f1243e regression test enforced).
-    const cacheKey = composeFetchCacheKey(source, url);
+    const cacheKey = source === undefined ? url : `${source}::${url}`;
     const meta = store.getSourceMeta(cacheKey);
     if (meta) {
       const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
@@ -2337,7 +2017,7 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       // or the network is briefly unavailable. Append the same retry hint
       // ssrfGuard's pre-flight DNS path emits so the agent doesn't capitulate
       // to training data on the first transient failure (PR #654 substitute —
-      // sibling-tool consistency with hooks/core/routing.mjs WebFetch wording).
+      // Keep fetch error wording consistent across call sites.
       const raw = result.stderr || result.stdout || "unknown error";
       const isTransientDns = /\b(EAI_AGAIN|ETIMEDOUT|ETIMEOUT|ENETUNREACH|EPERM|getaddrinfo)\b/.test(raw);
       const hint = isTransientDns
@@ -2392,18 +2072,15 @@ interface IndexedFetchResult {
  */
 function indexFetched(f: { url: string; source?: string; markdown: string; header: string }): IndexedFetchResult {
   const store = getStore();
-  // Storage label composed via composeFetchCacheKey so two URLs sharing a
-  // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
-  // still finds both via LIKE-mode source filter on the `source` substring.
-  const storageLabel = composeFetchCacheKey(f.source, f.url);
-  const attribution = currentAttribution();
+  // Include the URL when a source label is supplied so distinct URLs do not collide.
+  const storageLabel = f.source === undefined ? f.url : `${f.source}::${f.url}`;
   let indexed: IndexResult;
   if (f.header === "__CM_CT__:json") {
-    indexed = store.indexJSON(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexJSON(f.markdown, storageLabel);
   } else if (f.header === "__CM_CT__:text") {
-    indexed = store.indexPlainText(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexPlainText(f.markdown, storageLabel);
   } else {
-    indexed = store.index({ content: f.markdown, source: storageLabel, attribution });
+    indexed = store.index({ content: f.markdown, source: storageLabel });
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
@@ -2430,23 +2107,17 @@ registerCtxTool(
     },
     description: "Fetch and index URL content server-side so raw pages stay out of context. Use ctx_search for follow-up retrieval.",
     inputSchema: z.object({
-      url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
+      url: z.string().optional().describe("Single URL to fetch and index"),
       source: z
         .string()
         .optional()
         .describe("Label for a single URL; batch requests can set their own source."),
-      requests: z
-        .preprocess(
-          coerceJsonArray,
-          z.array(
-            z.object({
-              url: z.string().describe("URL to fetch"),
-              source: z.string().optional().describe("Label for this URL's indexed content"),
-            }),
-          ).min(1),
-        )
-        .optional()
-        .describe("Batch of {url, source?} entries."),
+      requests: z.array(
+        z.object({
+          url: z.string().describe("URL to fetch"),
+          source: z.string().optional().describe("Label for this URL's indexed content"),
+        }),
+      ).min(1).optional().describe("Batch of {url, source?} entries."),
       concurrency: z
         .coerce.number()
         .int()
@@ -2456,7 +2127,7 @@ registerCtxTool(
         .default(1)
         .describe("Parallel URL fetches, 1-8; indexing remains serial."),
       force: z
-        .preprocess(coerceBoolean, z.boolean())
+        .boolean()
         .optional()
         .describe("Skip cache and re-fetch even if content was recently indexed"),
       ttl: z
@@ -2646,8 +2317,7 @@ registerCtxTool(
     },
     description: "Run related commands in one call, index their full output, and return query matches. Use for related or large-output commands.",
     inputSchema: z.object({
-      commands: z.preprocess(coerceCommandsArray, z
-        .array(
+      commands: z.array(
           z.object({
             label: z
               .string()
@@ -2660,11 +2330,10 @@ registerCtxTool(
           }),
         )
         .min(1)
-        .describe("Commands to run; labels become indexed section headers.")),
-      queries: z.preprocess(coerceJsonArray, z
-        .array(z.string())
+        .describe("Commands to run; labels become indexed section headers."),
+      queries: z.array(z.string())
         .min(1)
-        .describe("Queries to extract from indexed batch output.")),
+        .describe("Queries to extract from indexed batch output."),
       timeout: z
         .coerce.number()
         .optional()
@@ -2739,7 +2408,7 @@ registerCtxTool(
         .map((c: { label: string; command: string }) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+      const indexed = store.index({ content: stdout, source });
 
       // Commands inventory — list what the agent actually ran so the
       // response itself documents intent, not just per-section echoes.
@@ -2803,11 +2472,6 @@ registerCtxTool(
   },
 );
 
-/**
- * Pi byte accounting: patch lifetime.totalEvents from bytes_sandboxed
- * in stats-*.json files instead of the default events × 256 heuristic.
- * Only active for Pi adapter — other platforms use getLifetimeStats() as-is.
- */
 // ── ctx-doctor: diagnostics (server-side) ─────────────────────────────────
 registerCtxTool(
   "ctx_doctor",
@@ -2821,10 +2485,11 @@ registerCtxTool(
     const lines: string[] = ["context-mode doctor", ""];
     lines.push(`[OK] Runtimes: ${available.length} — ${available.join(", ")}`);
 
-    const sessionStorage = resolveSessionStorageDir(getDefaultSessionDir);
-    const contentStorage = resolveContentStorageDir(getDefaultSessionDir);
-    lines.push(`[OK] Storage sessions: ${sessionStorage.path}`);
-    lines.push(`[OK] Storage content: ${contentStorage.path}`);
+    try {
+      lines.push(`[OK] Storage content: ${getContentDir()}`);
+    } catch (err) {
+      lines.push(`[FAIL] Storage content: ${err instanceof Error ? err.message : err}`);
+    }
 
     const testExecutor = new PolyglotExecutor({ runtimes });
     try {
@@ -2857,133 +2522,59 @@ registerCtxTool(
   },
 );
 
-// ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
-// ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
-//
-// Issue #520 — scoped purge.
-// The schema is ADDITIVE: bare {confirm:true} preserves the legacy
-// project-wide wipe verbatim (with a stderr deprecation warning so
-// future callers migrate to explicit scope). When sessionId is given,
-// only that session's rows + FTS5 chunks are removed; project-wide
-// files (events.md, FTS5 store file, stats file) are preserved.
-// Passing both sessionId AND scope:"project" is ambiguous (does the
-// caller want a per-session wipe or a project-wide one?) and is
-// rejected by an explicit check in the handler body — NOT a schema-level
-// .refine(). MCP SDK's normalizeObjectSchema() reads `.shape` to project
-// inputSchema → JSON Schema for tools/list; a ZodEffects (refine wrapper)
-// has no `.shape`, so the SDK silently emits `properties: {}`, and Claude
-// Code's strict-input-validation gate then rejects EVERY call to this
-// tool with "input_schema does not support fields". Issue #563.
+// ── ctx-purge: explicit project knowledge-base wipe ────────────────────────
+function deleteDbFamily(path: string): boolean {
+  let deleted = false;
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      unlinkSync(path + suffix);
+      deleted = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+  return deleted;
+}
+
 registerCtxTool(
   "ctx_purge",
   {
     title: "Purge Knowledge Base",
-    // #846: permanently deletes indexed content — destructive. Purging an
-    // already-purged scope has no further effect (idempotent). No network.
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    description: "Permanently delete indexed content. Requires confirm:true and a session or project scope; bare confirm:true keeps legacy project-wide behavior.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description: "Permanently delete indexed content for the current project. Requires confirm:true.",
     inputSchema: z.object({
-      // confirm: wrapped in coerceBoolean preprocessor — OpenCode's native
-      // plugin bridge can deliver `confirm:"true"` / `confirm:"false"` as
-      // string literals. Without this, v1.0.139's inputSchema.parse() path
-      // rejects valid intent as "Expected boolean, received string" (#627).
-      confirm: z.preprocess(coerceBoolean, z.boolean()).describe(
-        "MUST be true. Destructive operation; false returns 'purge cancelled'."
-      ),
-      sessionId: z.string().optional().describe(
-        "Session UUID; cannot be combined with scope:'project'."
-      ),
-      scope: z.enum(["session", "project"]).optional().describe("Scope selector."),
+      confirm: z.boolean().describe("MUST be true. Destructive operation; false returns 'purge cancelled'."),
     }),
   },
-  async ({ confirm, sessionId, scope }) => {
-    // Cross-field ambiguity check — formerly a schema .refine(), moved
-    // into the handler so the inputSchema stays a plain ZodObject and
-    // the MCP SDK can serialize `.shape` into JSON Schema (issue #563).
-    // Same human-readable message as the original refine() preserved.
-    if (sessionId && scope === "project") {
-      return trackResponse("ctx_purge", {
-        content: [{
-          type: "text" as const,
-          text:
-            "Ambiguous purge: sessionId implies scope:'session', cannot combine with scope:'project'. " +
-            "Use scope:'project' WITHOUT sessionId for the legacy whole-project wipe.",
-        }],
-        isError: true,
-      });
-    }
+  async ({ confirm }) => {
     if (!confirm) {
-      return trackResponse("ctx_purge", {
-        content: [{
-          type: "text" as const,
-          text: "Purge cancelled. Pass confirm: true to proceed.",
-        }],
-      });
+      return trackResponse("ctx_purge", { content: [{ type: "text" as const, text: "Purge cancelled. Pass confirm: true to proceed." }] });
     }
 
-    // Effective scope resolution:
-    //   - explicit scope wins
-    //   - else "session" iff sessionId is given
-    //   - else "project" (back-compat — emit deprecation warning so
-    //     callers migrate to the explicit form before a future major).
-    const effectiveScope: "session" | "project" =
-      scope ?? (sessionId ? "session" : "project");
-    if (!scope && !sessionId) {
-      console.warn(
-        "[context-mode] ctx_purge: bare {confirm:true} is deprecated. " +
-        "Pass scope:'project' for the whole-project wipe, or scope:'session' + sessionId " +
-        "for a scoped wipe. See issue #520."
-      );
-    }
-
-    // Close the persistent FTS5 content store handle BEFORE delegating to
-    // purgeSession so the store's lock is released on Windows. The handle
-    // is recreated lazily on the next getStore() call.
-    let storePathForPurge: string | undefined;
-    try {
-      storePathForPurge = getStorePath();
-    } catch { /* best effort — store path may be unresolvable on fresh install */ }
     if (_store) {
-      try { _store.cleanup(); } catch { /* best effort */ }
+      try { _store.close(); } catch {}
       _store = null;
     }
 
-    // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
-    // and legacy raw-casing variants (dual-hash, mirrors session events).
-    // storePath is also passed for the rare case where the resolver picked
-    // an absolute path that differs from the dual-hash pair (e.g. caller
-    // pre-migrated). Both paths are de-duped during unlink.
-    const contentDir = storePathForPurge ? dirname(storePathForPurge) : undefined;
-    const { deleted } = purgeSession({
-      projectDir: getProjectDir(),
-      sessionsDir: getSessionDir(),
-      storePath: storePathForPurge,
-      contentDir,
-      legacyContentDir: join(homedir(), ".context-mode", "content"),
-      // hashProjectDirLegacy mirrors the deployed (≤ v1.0.111) raw-casing
-      // hash that named files under ~/.context-mode/content/. Using the
-      // legacy hash here is correct: that pre-pre-legacy directory was
-      // never migrated and still uses raw casing.
-      contentHash: hashProjectDirLegacy(getProjectDir()),
-      scope: effectiveScope,
-      sessionId,
-    });
-
-    const message = effectiveScope === "session"
-      ? `Purged session ${sessionId}: ${deleted.length ? deleted.join(", ") : "no matching rows"}. ` +
-        `Other sessions and project-wide stats preserved.`
-      : `Purged: ${deleted.join(", ")}. All session data for this project has been permanently deleted.`;
-    return trackResponse("ctx_purge", {
-      content: [{
-        type: "text" as const,
-        text: message,
-      }],
-    });
+    try {
+      const projectDir = getProjectDir();
+      const currentDir = getContentDir();
+      const paths = new Set([
+        join(currentDir, `${projectHash(projectDir)}.db`),
+        join(currentDir, `${projectHash(projectDir, false)}.db`),
+        join(homedir(), ".context-mode", "content", `${projectHash(projectDir, false)}.db`),
+      ]);
+      let deleted = 0;
+      for (const path of paths) if (deleteDbFamily(path)) deleted++;
+      return trackResponse("ctx_purge", {
+        content: [{ type: "text" as const, text: deleted ? `Purged ${deleted} knowledge-base file set(s).` : "Nothing to purge." }],
+      });
+    } catch (err) {
+      return trackResponse("ctx_purge", {
+        content: [{ type: "text" as const, text: `Purge failed: ${err instanceof Error ? err.message : err}` }],
+        isError: true,
+      });
+    }
   },
 );
 
@@ -2994,8 +2585,6 @@ registerCtxTool(
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  cleanupStaleDBs();
-
   const shutdown = () => {
     executor.cleanupBackgrounded();
     if (_store) _store.close();

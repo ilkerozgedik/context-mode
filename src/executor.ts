@@ -22,17 +22,8 @@ const isWin = process.platform === "win32";
  */
 const SCRIPT_EXT: Record<Language, string> = {
   javascript: "js",
-  typescript: "ts",
   python: "py",
   shell: "sh",
-  ruby: "rb",
-  go: "go",
-  rust: "rs",
-  php: "php",
-  perl: "pl",
-  r: "R",
-  elixir: "exs",
-  csharp: "csx",
 };
 
 /** Pure helper — exported for unit testing. Returns "script" or "script.<ext>". */
@@ -287,11 +278,6 @@ export class PolyglotExecutor {
       const filePath = this.#writeScript(tmpDir, code, language);
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
-      // Rust: compile then run
-      if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
-      }
-
       // Every language runs in the project directory so git, relative paths,
       // and other project-aware tools resolve naturally. The script FILE lives
       // in the sandbox tmpDir and is passed to the runtime by absolute path
@@ -330,22 +316,6 @@ export class PolyglotExecutor {
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
-    // Go needs a main package wrapper if not present
-    if (language === "go" && !code.includes("package ")) {
-      code = `package main\n\nimport "fmt"\n\nfunc main() {\n${code}\n}\n`;
-    }
-
-    // PHP needs opening tag if not present
-    if (language === "php" && !code.trimStart().startsWith("<?")) {
-      code = `<?php\n${code}`;
-    }
-
-    // Elixir: prepend compiled BEAM paths when inside a Mix project
-    if (language === "elixir" && existsSync(join(this.#projectRoot, "mix.exs"))) {
-      const escaped = JSON.stringify(join(this.#projectRoot, "_build/dev/lib"));
-      code = `Path.wildcard(Path.join(${escaped}, "*/ebin"))\n|> Enum.each(&Code.prepend_path/1)\n\n${code}`;
-    }
-
     const fp = join(
       tmpDir,
       buildScriptFilename(
@@ -356,9 +326,6 @@ export class PolyglotExecutor {
     );
     if (language === "shell") {
       const shellPath = this.#runtimes.shell;
-      // #782 — on Windows Git Bash, rewrite bare `mvn` → `mvn.cmd` so Maven
-      // uses its native Windows launcher (correct path handling) instead of
-      // the broken mingw shell branch. No-op on non-Windows.
       const rewritten = rewriteWindowsBuildTools(code, process.platform);
       const shellCode = isWin && isPowerShell(shellPath)
         ? buildPowerShellScriptContent(rewritten)
@@ -374,38 +341,6 @@ export class PolyglotExecutor {
     return fp;
   }
 
-  async #compileAndRun(
-    srcPath: string,
-    cwd: string,
-    timeout: number | undefined,
-  ): Promise<ExecResult> {
-    const binSuffix = isWin ? ".exe" : "";
-    const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
-
-    // Compile — cap rustc invocation at 60s when caller didn't bound the
-    // overall timeout (a hung compile shouldn't run forever even if the
-    // caller is fine with a long-running binary afterwards).
-    try {
-      execFileSync("rustc", [srcPath, "-o", binPath], {
-        cwd,
-        timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? (err as any).stderr || err.message : String(err);
-      return {
-        stdout: "",
-        stderr: `Compilation failed:\n${message}`,
-        exitCode: 1,
-        timedOut: false,
-      };
-    }
-
-    // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
-  }
-
   async #spawn(
     cmd: string[],
     cwd: string,
@@ -414,56 +349,18 @@ export class PolyglotExecutor {
     background = false,
   ): Promise<ExecResult> {
     return new Promise((res) => {
-      // Only .cmd/.bat shims need shell on Windows; real executables don't.
-      // Using shell: true globally causes process-tree kill issues with MSYS2/Git Bash.
-      // "bun" is included as defense-in-depth: bunCommand() prefers absolute
-      // .exe paths now (#506), but if it falls back to the bare "bun" string
-      // on Windows that resolution typically goes through a `bun.cmd` shim
-      // (npm i -g bun) which CreateProcess can't execute without cmd.exe.
-      const needsShell = isWin && ["tsx", "ts-node", "elixir", "bun", "dotnet-script"].includes(cmd[0]);
-
-      // On Windows with Git Bash, pass the script as `bash -c "source /posix/path"`
-      // rather than `bash /path/to/script.sh`. This avoids MSYS2 path mangling
-      // while still allowing MSYS_NO_PATHCONV to protect non-ASCII paths in commands.
-      let spawnCmd = cmd[0];
-      let spawnArgs: string[];
-      if (isWin && cmd.length === 2 && cmd[1]) {
-        const posixPath = cmd[1].replace(/\\/g, "/");
-        spawnArgs = [posixPath];
-      } else {
-        spawnArgs = isWin
-          ? cmd.slice(1).map(a => a.replace(/\\/g, "/"))
-          : cmd.slice(1);
-      }
-
-      // Common options shared by both spawn variants below.
-      const commonOpts = {
+      const spawnCmd = cmd[0];
+      const spawnArgs = isWin
+        ? cmd.slice(1).map((arg) => arg.replace(/\\/g, "/"))
+        : cmd.slice(1);
+      const proc = spawn(spawnCmd, spawnArgs, {
         cwd,
-        stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
         env: this.#buildSafeEnv(sandboxTmpDir),
-        // On Unix, create a new process group so killTree can kill all children
         detached: !isWin,
-        // Hide the spawned-process console window on Windows. Without this,
-        // child_process.spawn creates a visible window that intercepts stdout,
-        // leaving the MCP response empty and popping a Git Bash terminal over
-        // the user's IDE. Issue #384.
         ...buildSpawnOptions(process.platform),
-      };
-
-      // DEP0190 fix: when shell is true (Windows .cmd/.bat shims), pass a
-      // single command string instead of cmd + args array. Node.js warns
-      // that args are unsafely concatenated when shell:true is combined with
-      // the args-array form of spawn(). Colllapsing to a string avoids the
-      // warning while preserving the same shell behavior.
-      let proc: ReturnType<typeof spawn>;
-      if (needsShell) {
-        const fullCmd = [spawnCmd, ...spawnArgs]
-          .map(a => /\s/.test(a) ? JSON.stringify(a) : a)
-          .join(" ");
-        proc = spawn(fullCmd, [], { ...commonOpts, shell: true });
-      } else {
-        proc = spawn(spawnCmd, spawnArgs, { ...commonOpts, shell: false });
-      }
+        shell: false,
+      });
 
       let timedOut = false;
       let resolved = false;
@@ -596,61 +493,6 @@ export class PolyglotExecutor {
       "PYTHONWARNINGS",       // triggers module import chain → RCE
       "PYTHONBREAKPOINT",     // arbitrary callable
       "PYTHONINSPECT",        // enters interactive mode after script
-      // Ruby — option/module injection
-      "RUBYOPT",              // injects CLI options (-r loads files)
-      "RUBYLIB",              // module search path injection
-      // Perl — option/module injection
-      "PERL5OPT",             // injects CLI options (-M runs code)
-      "PERL5LIB",             // module search path injection
-      "PERLLIB",              // legacy module search path
-      "PERL5DB",              // debugger command injection
-      // Elixir/Erlang — eval injection
-      "ERL_AFLAGS",           // prepends erl flags (-eval runs code)
-      "ERL_FLAGS",            // appends erl flags
-      "ELIXIR_ERL_OPTIONS",   // Elixir-specific erl flags
-      "ERL_LIBS",             // beam file loading
-      // Go — compiler/linker injection
-      "GOFLAGS",              // injects go command flags
-      "CGO_CFLAGS",           // C compiler flag injection
-      "CGO_LDFLAGS",          // linker flag injection
-      // Rust — compiler substitution
-      "RUSTC",                // arbitrary compiler binary
-      "RUSTC_WRAPPER",        // compiler wrapper injection
-      "RUSTC_WORKSPACE_WRAPPER",
-      "CARGO_BUILD_RUSTC",
-      "CARGO_BUILD_RUSTC_WRAPPER",
-      "RUSTFLAGS",            // compiler flag injection
-      // PHP — config injection
-      "PHPRC",                // auto_prepend_file → RCE
-      "PHP_INI_SCAN_DIR",     // additional .ini loading
-      // R — startup script injection
-      "R_PROFILE",            // site-wide R profile
-      "R_PROFILE_USER",       // user R profile
-      "R_HOME",               // R installation override
-      // .NET / C# — runtime/startup hooks, additional deps
-      "DOTNET_STARTUP_HOOKS",       // injects managed assemblies on startup
-      "DOTNET_ADDITIONAL_DEPS",     // additional .deps.json injection
-      "DOTNET_SHARED_STORE",        // shared assembly probe path injection
-      "DOTNET_ROOT",                // arbitrary .NET runtime override
-      "DOTNET_ROOT(x86)",           // 32-bit override
-      "DOTNET_HOST_PATH",           // host binary substitution
-      // .NET / C# — profiler attach (loads arbitrary DLL into dotnet host)
-      // and IPC-based debugger/IL injection. PR #546 follow-up.
-      // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
-      "CORECLR_PROFILER",                 // CLSID of profiler to attach
-      "CORECLR_PROFILER_PATH",            // path to profiler DLL
-      "CORECLR_PROFILER_PATH_32",         // 32-bit specific profiler DLL
-      "CORECLR_PROFILER_PATH_64",         // 64-bit specific profiler DLL
-      "CORECLR_PROFILER_PATH_ARM32",      // ARM32 specific profiler DLL
-      "CORECLR_PROFILER_PATH_ARM64",      // ARM64 specific profiler DLL
-      "CORECLR_ENABLE_PROFILING",         // gates profiler load
-      "DOTNET_PROFILER_PATH",             // cross-platform alias
-      "DOTNET_PROFILER_PATH_32",
-      "DOTNET_PROFILER_PATH_64",
-      "DOTNET_PROFILER_PATH_ARM32",
-      "DOTNET_PROFILER_PATH_ARM64",
-      "DOTNET_DiagnosticPorts",           // peer attach via diagnostic IPC
-      "DOTNET_BUNDLE_EXTRACT_BASE_DIR",   // single-file extraction hijack
       // Dynamic linker — shared library injection
       "LD_PRELOAD",           // loads .so before all others (Linux)
       "DYLD_INSERT_LIBRARIES", // macOS equivalent of LD_PRELOAD
@@ -672,17 +514,12 @@ export class PolyglotExecutor {
     ]);
 
     // Start with parent env, then strip dangerous vars and apply overrides.
-    // The `COMPlus_` prefix sweep covers every COMPlus_* synonym of the
-    // DOTNET_* runtime knobs (.NET back-compat alias — case-insensitive).
-    // PR #546 follow-up: closes the alias bypass for the explicit denylist
-    // entries above.
     const env: Record<string, string> = {};
     for (const [key, val] of Object.entries(process.env)) {
       if (
         val !== undefined &&
         !DENIED.has(key) &&
-        !key.startsWith("BASH_FUNC_") &&
-        !/^COMPlus_/i.test(key)
+        !key.startsWith("BASH_FUNC_")
       ) {
         env[key] = val;
       }
@@ -725,7 +562,7 @@ export class PolyglotExecutor {
       }
     }
 
-    // Ensure SSL_CERT_FILE is set so Python/Ruby HTTPS works in sandbox.
+    // Ensure SSL_CERT_FILE is set so Python HTTPS works in sandbox.
     if (!env["SSL_CERT_FILE"]) {
       const certPaths = isWin ? [] : [
         "/etc/ssl/cert.pem",                         // macOS, some Linux
@@ -750,36 +587,13 @@ export class PolyglotExecutor {
     code: string,
   ): string {
     const escaped = JSON.stringify(absolutePath);
-    switch (language) {
-      case "javascript":
-      case "typescript":
-        return `const FILE_CONTENT_PATH = ${escaped};\nconst file_path = FILE_CONTENT_PATH;\nconst FILE_CONTENT = require("fs").readFileSync(FILE_CONTENT_PATH, "utf-8");\n${code}`;
-      case "python":
-        return `FILE_CONTENT_PATH = ${escaped}\nfile_path = FILE_CONTENT_PATH\nwith open(FILE_CONTENT_PATH, "r", encoding="utf-8") as _f:\n    FILE_CONTENT = _f.read()\n${code}`;
-      case "shell": {
-        // Single-quote the path to prevent $, backtick, and ! expansion
-        const sq = "'" + absolutePath.replace(/'/g, "'\\''") + "'";
-        return `FILE_CONTENT_PATH=${sq}\nfile_path=${sq}\nFILE_CONTENT=$(cat ${sq})\n${code}`;
-      }
-      case "ruby":
-        return `FILE_CONTENT_PATH = ${escaped}\nfile_path = FILE_CONTENT_PATH\nFILE_CONTENT = File.read(FILE_CONTENT_PATH, encoding: "utf-8")\n${code}`;
-      case "go":
-        return `package main\n\nimport (\n\t"fmt"\n\t"os"\n)\n\nvar FILE_CONTENT_PATH = ${escaped}\nvar file_path = FILE_CONTENT_PATH\n\nfunc main() {\n\tb, _ := os.ReadFile(FILE_CONTENT_PATH)\n\tFILE_CONTENT := string(b)\n\t_ = FILE_CONTENT\n\t_ = fmt.Sprint()\n${code}\n}\n`;
-      case "rust":
-        return `#![allow(unused_variables)]\nuse std::fs;\n\nfn main() {\n    let file_content_path = ${escaped};\n    let file_path = file_content_path;\n    let file_content = fs::read_to_string(file_content_path).unwrap();\n${code}\n}\n`;
-      case "php":
-        return `<?php\n$FILE_CONTENT_PATH = ${escaped};\n$file_path = $FILE_CONTENT_PATH;\n$FILE_CONTENT = file_get_contents($FILE_CONTENT_PATH);\n${code}`;
-      case "perl":
-        return `my $FILE_CONTENT_PATH = ${escaped};\nmy $file_path = $FILE_CONTENT_PATH;\nopen(my $fh, '<:encoding(UTF-8)', $FILE_CONTENT_PATH) or die "Cannot open: $!";\nmy $FILE_CONTENT = do { local $/; <$fh> };\nclose($fh);\n${code}`;
-      case "r":
-        return `FILE_CONTENT_PATH <- ${escaped}\nfile_path <- FILE_CONTENT_PATH\nFILE_CONTENT <- readLines(FILE_CONTENT_PATH, warn=FALSE, encoding="UTF-8")\nFILE_CONTENT <- paste(FILE_CONTENT, collapse="\\n")\n${code}`;
-      case "elixir":
-        return `file_content_path = ${escaped}\nfile_path = file_content_path\nfile_content = File.read!(file_content_path)\n${code}`;
-      case "csharp":
-        // .csx forbids `using` directives after any other top-level statement
-        // (CS1529). User code inside executeFile must use fully-qualified type
-        // names (e.g. `System.Text.Json.JsonDocument`) instead of `using`.
-        return `var FILE_CONTENT_PATH = ${escaped};\nvar file_path = FILE_CONTENT_PATH;\nvar FILE_CONTENT = System.IO.File.ReadAllText(FILE_CONTENT_PATH);\n${code}`;
+    if (language === "javascript") {
+      return `const FILE_CONTENT_PATH = ${escaped};\nconst file_path = FILE_CONTENT_PATH;\nconst FILE_CONTENT = require("fs").readFileSync(FILE_CONTENT_PATH, "utf-8");\n${code}`;
     }
+    if (language === "python") {
+      return `FILE_CONTENT_PATH = ${escaped}\nfile_path = FILE_CONTENT_PATH\nwith open(FILE_CONTENT_PATH, "r", encoding="utf-8") as _f:\n    FILE_CONTENT = _f.read()\n${code}`;
+    }
+    const sq = "'" + absolutePath.replace(/'/g, "'\\''") + "'";
+    return `FILE_CONTENT_PATH=${sq}\nfile_path=${sq}\nFILE_CONTENT=$(cat ${sq})\n${code}`;
   }
 }

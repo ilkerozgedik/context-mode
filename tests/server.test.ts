@@ -20,6 +20,15 @@ describe("1MCP tool surface", () => {
     expect(REGISTERED_CTX_TOOLS.map((tool) => tool.name)).toEqual(EXPECTED_TOOLS);
   });
 
+  test("exposes only the three supported execution languages", () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
+    const schema = execute?.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(schema.safeParse({ language: "javascript", code: "" }).success).toBe(true);
+    expect(schema.safeParse({ language: "python", code: "" }).success).toBe(true);
+    expect(schema.safeParse({ language: "shell", code: "" }).success).toBe(true);
+    expect(schema.safeParse({ language: "ruby", code: "" }).success).toBe(false);
+  });
+
   test("uses the configured project root for deny policies", async () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-policy-"));
     try {

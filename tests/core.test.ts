@@ -6,8 +6,6 @@ import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
 import { evaluateCommandDenyOnly } from "../src/security.js";
 import { ContentStore } from "../src/store.js";
-import { SessionDB } from "../src/session/db.js";
-import { purgeSession } from "../src/session/purge.js";
 
 const tempDirs: string[] = [];
 function tempDir(): string {
@@ -25,7 +23,9 @@ describe("runtime and executor", () => {
     const runtimes = detectRuntimes();
     expect(runtimes.javascript).toBeTruthy();
     expect(runtimes.shell).toBeTruthy();
-    expect(getAvailableLanguages(runtimes)).toContain("javascript");
+    expect(getAvailableLanguages(runtimes)).toEqual(
+      runtimes.python ? ["javascript", "shell", "python"] : ["javascript", "shell"],
+    );
     expect(isAllowlistedShell(runtimes.shell)).toBe(true);
   });
 
@@ -72,18 +72,5 @@ describe("persistent core", () => {
     }
   });
 
-  test("opens the session database schema", () => {
-    const dir = tempDir();
-    const db = new SessionDB({ dbPath: join(dir, "session.db") });
-    try {
-      expect(db.getEventCount("missing-session")).toBe(0);
-    } finally {
-      db.close();
-    }
-  });
 
-  test("project purge is a no-op on a fresh directory", () => {
-    const dir = tempDir();
-    expect(() => purgeSession({ projectDir: dir, sessionsDir: dir, scope: "project" })).not.toThrow();
-  });
 });

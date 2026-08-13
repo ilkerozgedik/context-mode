@@ -31,14 +31,13 @@
   ],
   "scripts": {
     "build": "npm run typecheck && npm run bundle",
-    "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify",
+    "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --minify",
     "dev": "npx tsx src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@mixmark-io/domino": "^2.2.0",
     "better-sqlite3": "^12.6.2",
     "turndown": "^7.2.0",
     "turndown-plugin-gfm": "^1.0.2"
@@ -47,7 +46,6 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.11",
-    "@types/turndown": "^5.0.5",
     "esbuild": "^0.27.3",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0",
