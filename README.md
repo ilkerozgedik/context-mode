@@ -5,10 +5,10 @@ A public fork of [mksglu/context-mode](https://github.com/mksglu/context-mode) o
 ## Differences from upstream
 
 - Exposes only: `ctx_execute`, `ctx_execute_file`, `ctx_index`, `ctx_search`, `ctx_fetch_and_index`, `ctx_batch_execute`, `ctx_doctor`, `ctx_purge`.
-- Disables: `ctx_stats`, `ctx_upgrade`, `ctx_insight`.
+- Removes: `ctx_stats`, `ctx_upgrade`, `ctx_insight`.
 - Uses concise MCP tool metadata to reduce `tools/list` context cost.
-- Packages only the stdio server bundle; agent harness skills, hooks, plugins, statusline, and CLI helpers are not shipped.
-- Keeps upstream source compatibility code in the repository so future `main` updates remain easy to review and merge.
+- Keeps only the stdio server and core execution/index/search/fetch/purge/diagnostics source.
+- Agent adapters, hooks, plugins, statusline, CLI helpers, and Insight assets are removed from the fork.
 
 ## 1MCP configuration
 
@@ -35,7 +35,7 @@ No agent-harness platform variable is required.
 npm install
 npm run typecheck
 npm run bundle
-npx vitest run tests/core/server.test.ts
+npm test
 ```
 
 The committed `server.bundle.mjs` is the runtime artifact used by 1MCP.
@@ -44,4 +44,4 @@ The committed `server.bundle.mjs` is the runtime artifact used by 1MCP.
 
 Upstream project: <https://github.com/mksglu/context-mode>
 
-This fork intentionally diverges in MCP surface and packaging only; core execution, indexing, search, fetch, purge, and diagnostics behavior should stay as close to upstream `main` as possible.
+This fork intentionally removes upstream agent-harness code; the remaining execution, indexing, search, fetch, purge, and diagnostics core stays close to upstream where relevant to 1MCP.

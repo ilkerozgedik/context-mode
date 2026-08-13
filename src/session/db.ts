@@ -9,7 +9,7 @@
 import { SQLiteBase, defaultDBPath } from "../db-base.js";
 import type { PreparedStatement } from "../db-base.js";
 import type { SessionEvent } from "../types.js";
-import type { ProjectAttribution } from "./project-attribution.js";
+type ProjectAttribution = { projectDir: string; source: string; confidence: number };
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
@@ -543,7 +543,7 @@ export function resolveSessionPath(opts: {
       renameSync(legacyPath, canonicalPath);
     } catch {
       // Race or permission issue — caller will create canonicalPath on first
-      // write. Better to lose this rename than to throw and break ctx_stats.
+      // write. Better to lose this rename than to fail the caller.
     }
   }
   return canonicalPath;

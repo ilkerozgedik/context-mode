@@ -1,6 +1,6 @@
 /**
  * Unified multi-source search — merges ContentStore, SessionDB, and
- * auto-memory results into a single ranked or chronological result set.
+ * prior-session results into a single ranked or chronological result set.
  *
  * Used by ctx_search when sort="timeline" to search across all sources,
  * or sort="relevance" (default) for ContentStore-only BM25 search.
@@ -8,7 +8,6 @@
 
 import type { ContentStore, SearchResult } from "../store.js";
 import type { SessionDB, StoredEvent } from "../session/db.js";
-import { searchAutoMemory, type AutoMemoryAdapter } from "./auto-memory.js";
 
 const DEBUG = process.env.DEBUG?.includes("context-mode");
 
@@ -20,7 +19,7 @@ export interface UnifiedSearchResult {
   title: string;
   content: string;
   source: string;
-  origin: "current-session" | "prior-session" | "auto-memory";
+  origin: "current-session" | "prior-session";
   timestamp?: string;
   rank?: number;
   matchLayer?: string;
@@ -37,9 +36,6 @@ export interface SearchAllSourcesOpts {
   contentType?: "code" | "prose";
   sessionDB?: SessionDB | null;
   projectDir?: string;
-  configDir?: string;
-  /** Detected platform adapter — used for adapter-aware auto-memory. */
-  adapter?: AutoMemoryAdapter;
   /**
    * Per-project scope for the ContentStore filter (#737). Only honoured
    * when a `sessionDB` is also supplied (the 2-step IN-clause needs the
@@ -62,7 +58,7 @@ export interface SearchAllSourcesOpts {
  * Search across all available sources.
  *
  * - sort="relevance" (default): BM25-ranked results from ContentStore only.
- * - sort="timeline": chronological merge of ContentStore + SessionDB + auto-memory.
+ * - sort="timeline": chronological merge of ContentStore + SessionDB.
  *
  * Errors in any single source are caught and logged — partial results
  * are always returned.
@@ -77,8 +73,6 @@ export function searchAllSources(opts: SearchAllSourcesOpts): UnifiedSearchResul
     contentType,
     sessionDB,
     projectDir,
-    configDir,
-    adapter,
     projectScope,
   } = opts;
 
@@ -129,7 +123,7 @@ export function searchAllSources(opts: SearchAllSourcesOpts): UnifiedSearchResul
     if (DEBUG) process.stderr.write(`[ctx] ContentStore search failed: ${e}\n`);
   }
 
-  // ── Sources 2+3: timeline mode only ──
+  // ── Source 2: prior session events in timeline mode ──
   if (sort === "timeline") {
     // Source 2: SessionDB — prior session events
     try {
@@ -147,14 +141,6 @@ export function searchAllSources(opts: SearchAllSourcesOpts): UnifiedSearchResul
       }
     } catch (e) {
       if (DEBUG) process.stderr.write(`[ctx] SessionDB search failed: ${e}\n`);
-    }
-
-    // Source 3: Auto-memory
-    try {
-      const memResults = searchAutoMemory([query], limit, projectDir, configDir, adapter);
-      results.push(...memResults);
-    } catch (e) {
-      if (DEBUG) process.stderr.write(`[ctx] auto-memory search failed: ${e}\n`);
     }
   }
 

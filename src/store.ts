@@ -1476,7 +1476,7 @@ export class ContentStore {
   /**
    * Aggregate snapshot of the persistent content store. Returns total
    * chunk count, source count, and the most recent indexed_at timestamp.
-   * Used by ctx_stats so callers can see observability state in the same
+   * Exposes index state for diagnostics.
    * round trip instead of inferring it from snapshot diffs.
    */
   getIndexState(): { totalChunks: number; totalSources: number; lastIndexedAt?: string } {

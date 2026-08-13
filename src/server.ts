@@ -2,17 +2,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, writeSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
-import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { join, dirname, resolve, sep, isAbsolute } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { join, dirname, resolve, isAbsolute } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
-import { request as httpsRequest } from "node:https";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -27,34 +25,21 @@ import {
   detectRuntimes,
   getRuntimeSummary,
   getAvailableLanguages,
-  hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
-  describeStorageDirectorySource,
   ensureWritableStorageDir,
   formatStorageDirectoryError,
-  hashProjectDirCanonical,
   hashProjectDirLegacy,
   resolveContentStorePath,
   resolveContentStorageDir,
-  resolveDefaultSessionDir,
   resolveSessionDbPath,
   resolveSessionStorageDir,
-  resolveStatsStorageDir,
   SessionDB,
   StorageDirectoryError,
 } from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
-import {
-  emitCacheHitEvent,
-  emitIndexWriteEvent,
-  emitSandboxExecuteEvent,
-} from "./session/event-emit.js";
-import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
-import { appendRetrievalBytes } from "./session/retrieval-marker.js";
 import { searchAllSources } from "./search/unified.js";
 import {
   buildCtxSearchInputSchema,
@@ -62,15 +47,7 @@ import {
   resolveProjectScope,
 } from "./search/ctx-search-schema.js";
 import { FloodGuard } from "./search/flood-guard.js";
-import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
-import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
-import { parseCodexContextModePluginRoot } from "./adapters/codex/index.js";
-import { getHookScriptPaths } from "./util/hook-config.js";
-import { stripJsonComments } from "./util/jsonc.js";
-import { resolveClaudeConfigDir } from "./util/claude-config.js";
-import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -82,68 +59,20 @@ const VERSION: string = (() => {
   return "unknown";
 })();
 
-function getPackageRoot(): string {
-  return existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
-}
-
-function resolveCodexRuntimePluginRoot(fallbackRoot: string): string {
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
+});
+process.on("uncaughtException", (err) => {
   try {
-    const probe = process.platform === "win32"
-      ? spawnSync("cmd.exe", ["/d", "/s", "/c", "codex plugin list"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-      })
-      : spawnSync("codex", ["plugin", "list"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-      });
-    if (probe.status !== 0) return fallbackRoot;
-    const runtimeRoot = parseCodexContextModePluginRoot(String(probe.stdout));
-    if (runtimeRoot && existsSync(resolve(runtimeRoot, ".codex-plugin", "hooks.json"))) {
-      return runtimeRoot;
-    }
-  } catch {
-    // Best effort only. Non-Codex hosts and older Codex builds may not expose
-    // plugin list; keep the package-root fallback for those environments.
+    writeSync(2, `[context-mode] uncaughtException: ${err?.message ?? err}\n`);
+  } finally {
+    process.exit(1);
   }
-  return fallbackRoot;
-}
-
-function getRuntimeAwarePackageRoot(platformId?: PlatformId): string {
-  const packageRoot = getPackageRoot();
-  return platformId === "codex"
-    ? resolveCodexRuntimePluginRoot(packageRoot)
-    : packageRoot;
-}
-
-// Prevent silent MCP server death from unhandled async errors.
-//
-// Guarded for plugin-native OpenCode/Kilo imports (#574): when server.js is
-// imported only to reuse the ctx_* tool registry, these handlers would become
-// process-wide OpenCode/Kilo host handlers. In Node, adding an
-// `uncaughtException` listener changes default crash behavior, so only the
-// standalone MCP process may install them.
-if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
-  process.on("unhandledRejection", (err) => {
-    process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
-  });
-  process.on("uncaughtException", (err) => {
-    try {
-      writeSync(2, `[context-mode] uncaughtException: ${err?.message ?? err}\n`);
-    } finally {
-      process.exit(1);
-    }
-  });
-}
+});
 
 const runtimes = detectRuntimes();
 const available = getAvailableLanguages(runtimes);
-export const server = new McpServer({
-  name: "context-mode",
-  version: VERSION,
-});
+export const server = new McpServer({ name: "context-mode", version: VERSION });
 
 export interface RegisteredCtxTool {
   name: string;
@@ -153,222 +82,24 @@ export interface RegisteredCtxTool {
 
 export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
 
-const DISABLED_1MCP_TOOLS = new Set(["stats", "upgrade", "insight"].map((suffix) => `ctx_${suffix}`));
+const sdkRegisterTool = server.registerTool.bind(server);
 
-const MAX_SCHEMA_DESCRIPTION_CHARS = 96;
-
-function compactSchemaDescriptions(value: unknown, seen = new WeakSet<object>()): void {
-  if (!value || typeof value !== "object") return;
-  const object = value as Record<string, unknown>;
-  if (seen.has(object)) return;
-  seen.add(object);
-
-  const def = object._def;
-  if (def && typeof def === "object") {
-    const meta = def as Record<string, unknown>;
-    if (typeof meta.description === "string") {
-      const text = meta.description.replace(/\s+/g, " ").trim();
-      if (text.length <= MAX_SCHEMA_DESCRIPTION_CHARS) {
-        meta.description = text;
-      } else {
-        const sentenceEnd = text.search(/[.!?](?:\s|$)/);
-        if (sentenceEnd >= 23 && sentenceEnd < MAX_SCHEMA_DESCRIPTION_CHARS) {
-          meta.description = text.slice(0, sentenceEnd + 1);
-        } else {
-          const prefix = text.slice(0, MAX_SCHEMA_DESCRIPTION_CHARS - 1);
-          const wordEnd = prefix.lastIndexOf(" ");
-          meta.description = `${wordEnd >= 40 ? prefix.slice(0, wordEnd) : prefix}…`;
-        }
-      }
-    }
-    for (const nested of Object.values(meta)) compactSchemaDescriptions(nested, seen);
-  }
-
-  const shape = object.shape;
-  if (shape && typeof shape === "object") {
-    for (const nested of Object.values(shape as Record<string, unknown>)) {
-      compactSchemaDescriptions(nested, seen);
-    }
-  }
-}
-
-export function shouldSuppressMcpToolsForNativePluginHost(
-  opts: { embedded?: string; platform?: PlatformId; settings?: Record<string, unknown> | null } = {},
-): boolean {
-  const embedded = opts.embedded ?? process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
-  if (embedded === "1") return false;
-  const platform = opts.platform ?? detectPlatform().platform;
-  if (platform !== "opencode" && platform !== "kilo") return false;
-  const settings = opts.settings ?? readNativePluginHostSettings(platform);
-  return settingsHasContextModePlugin(settings) && settingsHasLegacyContextModeMcp(settings);
-}
-
-function readNativePluginHostSettings(platform: PlatformId): Record<string, unknown> | null {
-  const base = platform === "kilo" ? "kilo" : "opencode";
-  const paths = [
-    resolve(`${base}.json`),
-    resolve(`${base}.jsonc`),
-    resolve(`.${base}`, `${base}.json`),
-    resolve(`.${base}`, `${base}.jsonc`),
-    join(homedir(), ".config", base, `${base}.json`),
-    join(homedir(), ".config", base, `${base}.jsonc`),
-  ];
-  for (const p of paths) {
-    try {
-      if (!existsSync(p)) continue;
-      return JSON.parse(stripJsonComments(readFileSync(p, "utf8"))) as Record<string, unknown>;
-    } catch { /* try next config path */ }
-  }
-  return null;
-}
-
-function settingsHasContextModePlugin(settings: Record<string, unknown> | null | undefined): boolean {
-  const plugins = settings?.plugin;
-  return Array.isArray(plugins) && plugins.some((p) => typeof p === "string" && p.includes("context-mode"));
-}
-
-function settingsHasLegacyContextModeMcp(settings: Record<string, unknown> | null | undefined): boolean {
-  const mcp = settings?.mcp;
-  return !!(
-    mcp &&
-    typeof mcp === "object" &&
-    !Array.isArray(mcp) &&
-    Object.prototype.hasOwnProperty.call(mcp, "context-mode")
-  );
-}
-
-const suppressMcpToolsForNativePluginHost = shouldSuppressMcpToolsForNativePluginHost();
-
-/**
- * Issue #623 — surface why ctx_* tools/list is empty on suppressed legacy MCP
- * children. When a user upgrades OpenCode/Kilo from v1.0.136 → v1.0.137+ without
- * running `context-mode upgrade`, their opencode.json still has BOTH the legacy
- * mcp.context-mode block AND the plugin entry. The plugin path registers the
- * tools natively, but the legacy MCP child runs in parallel and used to expose
- * duplicate tools — v1.0.137 suppressed those duplicates. The suppression was
- * silent, leaving any MCP client that inspected the child via tools/list with
- * an empty list and no diagnostic. Emit one stderr line per process so an
- * operator running the child directly (or any non-plugin MCP host) sees the
- * exact reason and the `context-mode upgrade` fix.
- *
- * Exported for test (suppression-diagnostic regression guard).
- */
-let __suppressionDiagnosticEmitted = false;
-export function emitSuppressionDiagnostic(
-  opts: { platform?: string; write?: (chunk: string) => void } = {},
-): void {
-  if (__suppressionDiagnosticEmitted) return;
-  __suppressionDiagnosticEmitted = true;
-  const write = opts.write ?? ((c: string) => { process.stderr.write(c); });
-  const platform = opts.platform ?? "opencode/kilo";
-  write(
-    `[context-mode] ctx_* tools/list intentionally empty on this MCP child: ` +
-    `legacy mcp.context-mode block coexists with plugin: ["context-mode"] in ` +
-    `${platform}.json — plugin-native tools are the supported path (#623). ` +
-    `Run \`context-mode upgrade\` to remove the legacy block (preserves other ` +
-    `MCP servers).\n`
-  );
-}
-/** Test-only: reset the one-shot emission flag so suites can re-exercise. */
-export function __resetSuppressionDiagnosticForTests(): void {
-  __suppressionDiagnosticEmitted = false;
-}
-
-/**
- * Issue #637 — register an explicit empty `tools/list` handler on the McpServer.
- *
- * Background: when `suppressMcpToolsForNativePluginHost` is true, every
- * `server.registerTool()` call is short-circuited (returns `undefined` above).
- * The MCP SDK only installs the SDK-default `tools/list` handler when at least
- * one `registerTool()` reaches `setToolRequestHandlers()` internally
- * (mcp.js:56-67). Suppressing every registration leaves `tools/list`
- * unregistered, and the framework's RPC layer answers it with
- * `-32601 "Method not found"`.
- *
- * The reporter of #637 (SquirrelRat) inspected the suppressed child via
- * `tools/list` and read the JSON-RPC error as "the plugin never registers any
- * ctx_* tools" — when in fact the plugin DOES register all 11 tools natively
- * (verified at `src/adapters/opencode/plugin.ts:469` and
- * `tests/opencode-plugin.test.ts:88`). The misleading -32601 is the seed of
- * the #637 perception.
- *
- * This helper installs an explicit handler that returns `{tools: []}` — a
- * spec-compliant empty list. Paired with the existing #623 stderr diagnostic,
- * an operator now sees:
- *   - wire response: `{tools: []}` (matches expectation, no JSON-RPC error)
- *   - stderr: `[context-mode] ctx_* tools/list intentionally empty… (#623)`
- *
- * Idempotent: throws inside SDK if called twice on the same server because
- * `assertCanSetRequestHandler` (mcp.js:60) rejects duplicate registrations;
- * we therefore install the SDK's default tool handlers FIRST (via a no-op
- * registerTool of a fake tool, immediately removed) only if needed. To keep
- * the public surface minimal, we just call `server.server.setRequestHandler`
- * directly — that is the same low-level call used for prompts/resources at
- * server.ts:259-261 and avoids the SDK guard entirely.
- *
- * Exported for test (#637 in-memory regression guard).
- */
-export function registerEmptyToolsListHandler(target: McpServer = server): void {
-  target.server.registerCapabilities({ tools: { listChanged: false } });
-  target.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
-}
-
-const originalRegisterTool = server.registerTool.bind(server);
-(server as unknown as { registerTool: (...args: unknown[]) => unknown }).registerTool = (...args: unknown[]) => {
-  const [name, config, handler] = args as [
-    string,
-    Record<string, unknown>,
-    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-  ];
-  if (DISABLED_1MCP_TOOLS.has(name)) return undefined;
-  if (suppressMcpToolsForNativePluginHost) {
-    emitSuppressionDiagnostic();
-    return undefined;
-  }
-  compactSchemaDescriptions(config.inputSchema);
-  const wrappedHandler = wrapToolHandler(name, handler);
-  REGISTERED_CTX_TOOLS.push({ name, config, handler: wrappedHandler });
-  args[2] = wrappedHandler;
-  return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
-};
-
-function wrapToolHandler(
+function registerCtxTool(
   name: string,
-  handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-): (toolArgs: Record<string, unknown>) => Promise<unknown> {
-  return async (toolArgs: Record<string, unknown>) => {
-    // #854: mark a tool call in-flight so the bridge-child idle reaper never
-    // shuts the server down mid-execution during a long ctx_execute/batch that
-    // emits no further inbound messages. Symmetric end in finally (success+error).
-    noteRequestStart();
+  config: Record<string, unknown>,
+  handler: (toolArgs: any) => Promise<any> | any,
+): unknown {
+  const wrappedHandler = async (toolArgs: any) => {
     try {
       return await handler(toolArgs);
     } catch (err) {
       const result = storageErrorResult(err);
-      if (result) {
-        try {
-          return trackResponse(name, result);
-        } catch (trackErr) {
-          if (trackErr instanceof StorageDirectoryError) return result;
-          throw trackErr;
-        }
-      }
+      if (result) return result;
       throw err;
-    } finally {
-      noteRequestEnd();
     }
   };
-}
-
-// Issue #637 — when suppression is active, install the empty tools/list handler
-// once at module-init time so the suppressed MCP child responds with
-// `{tools: []}` instead of JSON-RPC `-32601 Method not found`. Pair with the
-// #623 stderr diagnostic that explains WHY the list is empty. Skipped for the
-// embedded plugin-import path because the embedded process is not the stdio
-// MCP child an operator would inspect — it lives inside the OpenCode/Kilo
-// host and never speaks JSON-RPC over stdio.
-if (suppressMcpToolsForNativePluginHost && process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
-  registerEmptyToolsListHandler(server);
+  REGISTERED_CTX_TOOLS.push({ name, config, handler: wrappedHandler });
+  return (sdkRegisterTool as any)(name, config, wrappedHandler);
 }
 
 type ToolContextOverride = { projectDir: string; sessionId?: string };
@@ -380,77 +111,6 @@ export async function withProjectDirOverride<T>(
 ): Promise<T> {
   const ctx = typeof projectDir === "string" ? { projectDir } : projectDir;
   return projectDirOverride.run(ctx, fn);
-}
-
-// Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
-// OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
-// the SDK transport layer, causing subsequent listTools() calls to fail permanently.
-import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false } });
-server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
-server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
-server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));
-
-// ── Strict-client (Gemini function-calling) schema compatibility ──────────────
-// Gemini's function-calling API — used by Antigravity CLI (`agy`) and Gemini CLI
-// — rejects JSON Schema `const` and `additionalProperties`. A rejected parameter
-// schema makes the host SILENTLY DROP that tool from the model's function list,
-// so the agent never sees our ctx_* tools and falls back to hand-rolling the MCP
-// protocol through its Bash tool. Sanitize the EMITTED tools/list schema:
-//   • `const: X`  →  `enum: [X]`   — an identical single-value constraint
-//   • drop `additionalProperties`  — advisory only; every ctx_* handler parses
-//     args with Zod (which strips unknown keys server-side), so removing it
-//     changes no validation and no call behavior.
-// Both transforms are behavior-preserving for every other client (Claude Code,
-// Copilot, Cursor, …): `const` and a one-value `enum` are equivalent, and no
-// model sends undeclared properties. Only the wire schema changes — never
-// validation or how any tool is invoked.
-export function sanitizeSchemaForStrictClients(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(sanitizeSchemaForStrictClients);
-  if (node === null || typeof node !== "object") return node;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    if (key === "additionalProperties") continue;
-    if (key === "const") {
-      out.enum = [value];
-      continue;
-    }
-    out[key] = sanitizeSchemaForStrictClients(value);
-  }
-  return out;
-}
-
-// Wrap the SDK-installed tools/list handler so its generated schemas pass through
-// the sanitizer above. Best-effort by design: if the MCP SDK's internals shift,
-// the original handler is left untouched (no regression — strict clients stay as
-// they were, every other client unaffected). Must run AFTER all registerTool()
-// calls so the SDK's default tools/list handler already exists.
-export function installStrictClientSchemaCompat(target: McpServer = server): void {
-  try {
-    const low = target.server as unknown as {
-      _requestHandlers?: Map<string, (req: unknown, extra: unknown) => Promise<unknown>>;
-    };
-    const original = low._requestHandlers?.get("tools/list");
-    if (typeof original !== "function") return;
-    target.server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => {
-      const result = (await original(req as unknown, extra as unknown)) as
-        | { tools?: Array<{ inputSchema?: unknown }> }
-        | undefined;
-      if (result && Array.isArray(result.tools)) {
-        for (const tool of result.tools) {
-          if (!tool || tool.inputSchema == null) continue;
-          try {
-            tool.inputSchema = sanitizeSchemaForStrictClients(tool.inputSchema);
-          } catch {
-            /* leave this tool's schema unchanged */
-          }
-        }
-      }
-      return result as never;
-    });
-  } catch {
-    /* best-effort — never break tools/list */
-  }
 }
 
 const executor = new PolyglotExecutor({
@@ -469,10 +129,7 @@ writeFileSync(
   CM_FS_PRELOAD,
   `(function(){var __cm_fs=0;process.on('exit',function(){if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch(e){}});try{var f=require('fs');var ors=f.readFileSync;f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};}catch(e){}})();\n`,
 );
-// In the stdio MCP path, main() also removes this file during graceful
-// shutdown. Plugin-native OpenCode/Kilo imports skip main() (#574), so
-// register a top-level best-effort cleanup too to avoid leaking preload
-// snippets under /tmp when the host process exits.
+// Best-effort cleanup in case the process exits before main() shutdown.
 process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
 // Lazy singleton — no DB overhead unless index/search is used
@@ -488,219 +145,24 @@ let _store: ContentStore | null = null;
  */
 export function currentAttribution(): { sessionId?: string } | undefined {
   const override = projectDirOverride.getStore();
-  if (override?.sessionId) return { sessionId: override.sessionId };
-
-  // CLAUDE_SESSION_ID env var is NOT propagated to MCP servers (only to hooks).
-  // Cross-adapter resolution: every adapter (15 of them) sets *_PROJECT_DIR env
-  // and writes session_events via hooks. Read the most-recent session_id from
-  // THIS project's session DB. Works for claude-code/cursor/gemini-cli/codex/
-  // kiro/opencode/zed/kilo/openclaw/qwen-code/vscode-copilot/jetbrains-copilot/
-  // omp/pi/antigravity — no adapter-specific transcript path required.
-  const sessionId = process.env.CLAUDE_SESSION_ID ?? resolveSessionIdFromSessionDB();
-  if (!sessionId) return undefined;
-  return { sessionId };
+  const sessionId = override?.sessionId ?? process.env.CONTEXT_MODE_SESSION_ID?.trim();
+  return sessionId ? { sessionId } : undefined;
 }
 
-let __cachedSessionId: { sid: string; checkedAt: number } | undefined;
-/** v1.0.134 SLICE A: opts injection for testability. Production callers pass nothing. */
-export function resolveSessionIdFromSessionDB(opts?: {
-  projectDir?: string;
-  sessionsDir?: string;
-  bypassCache?: boolean;
-}): string | undefined {
-  // 2s cache — ctx_fetch_and_index can fire 5+ chunks/sec; DB open cost adds up.
-  const now = Date.now();
-  if (!opts?.bypassCache && __cachedSessionId && now - __cachedSessionId.checkedAt < 2000) {
-    return __cachedSessionId.sid;
-  }
-  try {
-    const projectDir = opts?.projectDir
-      ?? process.env.CLAUDE_PROJECT_DIR
-      ?? process.env.CONTEXT_MODE_PROJECT_DIR;
-    if (!projectDir) return undefined;
-    const sessionsDir = opts?.sessionsDir ?? getSessionDir();
-    const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
-    if (!existsSync(dbPath)) return undefined;
-    const Database = loadDatabase();
-    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-    try {
-      const row = db.prepare(
-        "SELECT session_id FROM session_events ORDER BY created_at DESC LIMIT 1"
-      ).get() as { session_id?: string } | undefined;
-      const sid = row?.session_id;
-      if (sid) __cachedSessionId = { sid, checkedAt: now };
-      return sid;
-    } finally {
-      try { db.close(); } catch { /* best-effort */ }
-    }
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Auto-index session events files written by SessionStart hook.
- * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
- * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
- * so we glob-scan instead of computing a specific hash.
- * Files are consumed (deleted) after indexing to prevent double-indexing.
- * Called on every getStore() — readdirSync is sub-millisecond when no files match.
- */
-function maybeIndexSessionEvents(store: ContentStore): void {
-  try {
-    const sessionsDir = getSessionDir();
-    if (!existsSync(sessionsDir)) return;
-    const files = readdirSync(sessionsDir).filter(f => f.endsWith("-events.md"));
-    for (const file of files) {
-      const filePath = join(sessionsDir, file);
-      try {
-        store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
-        unlinkSync(filePath);
-      } catch { /* best-effort per file */ }
-    }
-  } catch { /* best-effort — session continuity never blocks tools */ }
-}
-
-// ── Platform-aware paths ──────────────────────────────────────────────────
-// The adapter (stored after MCP handshake) is the canonical source for
-// platform-specific paths. All session DB paths go through it — no
-// hardcoded configDir detection in tool handlers.
-
-let _detectedAdapter: HookAdapter | null = null;
-
-/**
- * Resolve the Claude Code config root, honoring `CLAUDE_CONFIG_DIR` (incl.
- * leading `~`) before falling back to `~/.claude`. Mirrors
- * `hooks/session-helpers.mjs::resolveConfigDir` and
- * `ClaudeCodeAdapter.getConfigDir` so the pre-detection path agrees with
- * hooks/adapter on where Claude Code session data lives. See issue #453.
- *
- * Issue #460 round-3: delegates to the canonical util so empty/whitespace
- * env values fall back instead of poisoning downstream `join()` calls.
- */
-async function getDiagnosticAdapter(): Promise<HookAdapter | null> {
-  if (_detectedAdapter) return _detectedAdapter;
-  try {
-    const { getAdapter } = await import("./adapters/detect.js");
-    const signal = detectPlatform();
-    return await getAdapter(signal.platform);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Get the platform-specific sessions directory from the detected adapter.
- * Falls back to the detected platform config root before adapter detection.
- */
 function getDefaultSessionDir(): string {
-  if (_detectedAdapter) return _detectedAdapter.getSessionDir();
-  // Pre-detection path (race window before MCP `initialize` completes):
-  // call detectPlatform() (sync, env-var-based) and look up segments via
-  // getSessionDirSegments() (sync map, no adapter instantiation). This keeps
-  // non-Claude platforms from spilling sessions into ~/.claude/. For Claude
-  // Code/Codex (single-segment roots), reroute through their config-dir
-  // contracts so the pre-detection window does not split-state with hooks.
-  try {
-    const signal = detectPlatform();
-    const segments = getSessionDirSegments(signal.platform);
-    if (segments) {
-      return resolveDefaultSessionDir({
-        configDir: join(...segments),
-        configDirEnv: configDirEnvForSessionSegments(segments),
-      });
-    }
-  } catch { /* fall through to claude fallback */ }
-  return resolveDefaultSessionDir({ configDir: ".claude", configDirEnv: "CLAUDE_CONFIG_DIR" });
-}
-
-function configDirEnvForSessionSegments(segments: string[]): string | undefined {
-  if (segments.length === 1 && segments[0] === ".claude") return "CLAUDE_CONFIG_DIR";
-  if (segments.length === 1 && segments[0] === ".codex") return "CODEX_HOME";
-  return undefined;
+  return join(homedir(), ".claude", "context-mode", "sessions");
 }
 
 function getSessionDir(): string {
   return ensureWritableStorageDir(resolveSessionStorageDir(getDefaultSessionDir));
 }
 
-/**
- * Project directory detection across supported platforms.
- *
- * Priority:
- *   1. Platform-specific env var (set by host IDE before MCP server spawn)
- *   2. CONTEXT_MODE_PROJECT_DIR (set by start.mjs for ALL platforms — universal)
- *   3. process.cwd() (last resort)
- *
- * CONTEXT_MODE_PROJECT_DIR guarantees correct projectDir even for platforms
- * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
- */
 export function getProjectDir(): string {
   const override = projectDirOverride.getStore();
   if (override) return override.projectDir;
-
-  // Delegated to the shared resolver so the env-var chain rejects plugin
-  // install paths (set by a prior MCP boot's start.mjs after `/ctx-upgrade`)
-  // and prefers the shell-set PWD before the chdir'd cwd. v1.0.115 adds
-  // the Claude Code transcript heuristic — read `cwd` from the most-recently-
-  // modified `~/.claude/projects/<encoded>/<session>.jsonl` to recover the
-  // real project dir when MCP was launched from a non-project cwd (desktop-
-  // app launch, /ctx-upgrade respawn). See src/util/project-dir.ts.
-  //
-  // Issue #521 (v1.0.119): the transcript heuristic ONLY applies on Claude
-  // Code. Other platforms (Cursor, OpenCode, Codex, ...) either have no
-  // transcript at that path or use a different schema without `cwd`. Worse,
-  // a Cursor user who also runs Claude Code would pick up the most-recently-
-  // modified Claude Code session's cwd — wrong project entirely. Gate the
-  // path on detected platform so non-Claude hosts skip the heuristic and
-  // fall through to PWD/cwd cleanly.
-  //
-  // The Claude heuristic must also be fresh. Hosts such as Pi can be
-  // misdetected as Claude Code solely because ~/.claude exists; without a
-  // freshness guard an old Claude transcript can globally hijack ctx shell cwd
-  // after reboot. Active Claude sessions update their transcript as the user
-  // interacts, so stale transcripts should fall through to PWD/cwd.
-  //
-  // Issue #545 (v1.0.124): pass strictPlatform for ALL adapters so the
-  // env-var cascade is built ALGORITHMICALLY from the platform's own
-  // workspace vars + universal escape hatch — foreign workspace vars (e.g.
-  // CLAUDE_PROJECT_DIR leaked into Pi's MCP child env from the user's shell)
-  // cannot win, regardless of cascade order. start.mjs intentionally does
-  // NOT pass strictPlatform — host detection is unreliable at the entrypoint
-  // and the legacy literal cascade is preserved there for semver safety.
-  let transcriptsRoot: string | undefined;
-  let strictPlatform: PlatformId | undefined;
-  let codexHome: string | undefined;
-  try {
-    const detected = detectPlatform().platform;
-    strictPlatform = detected;
-    if (detected === "claude-code") {
-      transcriptsRoot = join(homedir(), ".claude", "projects");
-    }
-    // Issue #45 — Codex publishes no workspace env var, so the resolver
-    // reads `meta.cwd` from the most-recently-modified session.jsonl under
-    // `${codexHome}/sessions/`. Wire codexHome at the call site so the
-    // resolver can be exercised under test without process-level mutation.
-    if (detected === "codex") {
-      codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
-    }
-  } catch { /* detection failure — leave undefined, resolver uses legacy cascade */ }
-  return resolveProjectDir({
-    env: process.env,
-    cwd: process.cwd(),
-    pwd: process.env.PWD,
-    transcriptsRoot,
-    transcriptMaxAgeMs: 5 * 60 * 1000,
-    strictPlatform,
-    codexHome,
-  });
+  return resolve(process.env.CONTEXT_MODE_PROJECT_DIR?.trim() || process.env.PWD || process.cwd());
 }
 
-/**
- * Resolve a possibly-relative path against the project directory (full env cascade),
- * not the MCP server's process.cwd(). MCP server is spawned by the host and its cwd
- * is unrelated to where the user is working.
- */
 function resolveProjectPath(filePath: string): string {
   return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
@@ -777,24 +239,8 @@ function getStore(): ContentStore {
     // Also clean old PID-based DBs from migration
     cleanupStaleDBs();
   }
-  maybeIndexSessionEvents(_store);
   return _store;
 }
-
-// ─────────────────────────────────────────────────────────
-// Session stats — track context consumption per tool
-// ─────────────────────────────────────────────────────────
-
-const sessionStats = {
-  calls: {} as Record<string, number>,
-  bytesReturned: {} as Record<string, number>,
-  bytesIndexed: 0,
-  bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
-  cacheHits: 0,
-  cacheMisses: 0, // ctx_fetch_and_index calls that bypassed the TTL cache
-  cacheBytesSaved: 0, // bytes avoided by TTL cache hits
-  sessionStart: Date.now(),
-};
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -803,342 +249,18 @@ type ToolResult = {
 
 function storageErrorResult(err: unknown): ToolResult | null {
   if (!(err instanceof StorageDirectoryError)) return null;
-  return {
-    content: [{ type: "text", text: formatStorageDirectoryError(err) }],
-    isError: true,
-  };
-}
-// ── Version outdated warning ──────────────────────────────────────────────
-// Non-blocking npm check at startup. trackResponse prepends warning
-// using a burst cadence: 3 warnings → 1h silent → 3 warnings → repeat.
-
-let _latestVersion: string | null = null;
-let _warningBurstCount = 0;
-let _lastBurstStart = 0;
-const VERSION_BURST_SIZE = 3;
-const VERSION_SILENT_MS = 60 * 60 * 1000; // 1 hour
-
-async function fetchLatestVersion(): Promise<string> {
-  return new Promise((res) => {
-    const req = httpsRequest(
-      "https://registry.npmjs.org/context-mode/latest",
-      { headers: { Connection: "close" } },
-      (resp) => {
-        let raw = "";
-        resp.on("data", (chunk: Buffer) => { raw += chunk; });
-        resp.on("end", () => {
-          try {
-            const data = JSON.parse(raw) as { version?: string };
-            res(data.version ?? "unknown");
-          } catch { res("unknown"); }
-        });
-      },
-    );
-    req.on("error", () => res("unknown"));
-    req.setTimeout(5000, () => { req.destroy(); res("unknown"); });
-    req.end();
-  });
+  return { content: [{ type: "text", text: formatStorageDirectoryError(err) }], isError: true };
 }
 
-function getUpgradeHint(): string {
-  const name = _detectedAdapter?.name;
-  if (name === "Claude Code") return "/ctx-upgrade";
-  if (name === "OpenClaw") return "npm run install:openclaw";
-  if (name === "Pi") return "npm run build";
-  return "npm update -g context-mode";
-}
-
-function semverNewer(a: string, b: string): boolean {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true;
-    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false;
-  }
-  return false;
-}
-
-function isOutdated(): boolean {
-  if (!_latestVersion || _latestVersion === "unknown") return false;
-  return semverNewer(_latestVersion, VERSION);
-}
-
-function shouldShowVersionWarning(): boolean {
-  if (!isOutdated()) return false;
-  const now = Date.now();
-  // Start of a new burst?
-  if (_warningBurstCount >= VERSION_BURST_SIZE) {
-    if (now - _lastBurstStart < VERSION_SILENT_MS) return false; // still silent
-    _warningBurstCount = 0; // silence over, reset burst
-  }
-  if (_warningBurstCount === 0) _lastBurstStart = now;
-  _warningBurstCount++;
-  return true;
-}
-
-// ── Self-heal Layer 2: Mid-session registry heal (anthropics/claude-code#46915) ──
-// Runs once on first tool call. If Claude Code auto-updated the registry mid-session,
-// hooks break because CLAUDE_PLUGIN_ROOT points to a deleted directory. We create a
-// symlink from the broken path to our actual directory so hooks recover.
-let _cacheHealDone = false;
-function healCacheMidSession(): void {
-  if (_cacheHealDone) return;
-  _cacheHealDone = true;
-  try {
-    // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so users who relocate
-    // their CC config root don't have plugin cache healing operate against
-    // the wrong tree (and silently miss dangling-symlink cleanup).
-    const claudeRoot = resolveClaudeConfigDir();
-    const ipPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
-    if (!existsSync(ipPath)) return;
-    const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-    const cacheRoot = resolve(claudeRoot, "plugins", "cache");
-    // Issue #795: canonicalize cacheRoot so the traversal guard works when
-    // ~/.claude is a symlink to another volume.  path.resolve() does not
-    // dereference symlinks, so installPath values stored as physical paths
-    // (e.g. /Volumes/SSD/.../plugins/cache/...) would fail the startsWith
-    // check against a symlink-path cacheRoot (/Users/me/.claude/...).
-    // realpathSync follows the symlink chain to the canonical location.
-    let cacheRootCanon: string;
-    try { cacheRootCanon = realpathSync(cacheRoot); }
-    catch { cacheRootCanon = cacheRoot; }
-    // Plugin root: build/ for tsc, plugin root for bundle
-    const pluginRoot = getPackageRoot();
-    for (const [key, entries] of Object.entries((ip.plugins ?? {}) as Record<string, Array<{ installPath?: string }>>)) {
-      if (key !== "context-mode@context-mode") continue;
-      for (const entry of entries) {
-        const rp = entry.installPath;
-        if (!rp || existsSync(rp)) continue;
-        // Path traversal guard (canonical comparison — see #795)
-        if (!resolve(rp).startsWith(cacheRootCanon + sep)) continue;
-        // Remove dangling symlink
-        try { if (lstatSync(rp).isSymbolicLink()) unlinkSync(rp); } catch {}
-        const parent = dirname(rp);
-        if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
-        if (existsSync(pluginRoot)) {
-          symlinkSync(pluginRoot, rp, process.platform === "win32" ? "junction" : undefined);
-        }
-      }
-    }
-  } catch { /* best effort */ }
-}
-
-function trackResponse(toolName: string, response: ToolResult): ToolResult {
-  // #854: a response is activity too — refresh the bridge-child idle clock so a
-  // chatty/streaming call keeps its server alive even between inbound frames.
-  noteMcpActivity();
-  // Mid-session cache heal — one-shot, first tool call
-  healCacheMidSession();
-  // Prepend version outdated warning if needed
-  if (shouldShowVersionWarning() && response.content.length > 0) {
-    const hint = getUpgradeHint();
-    response.content[0].text =
-      `⚠️ context-mode v${VERSION} outdated → v${_latestVersion} available. Upgrade: ${hint}\n\n` +
-      response.content[0].text;
-  }
-
-  const bytes = response.content.reduce(
-    (sum, c) => sum + Buffer.byteLength(c.text),
-    0,
-  );
-  sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
-  sessionStats.bytesReturned[toolName] =
-    (sessionStats.bytesReturned[toolName] || 0) + bytes;
-
-  // Persist a sidecar JSON snapshot for the statusline — read at ~3-5 Hz by
-  // bin/statusline.mjs (and any external dashboard) so they don't have to
-  // open the SQLite database. Throttled inside persistStats() (500ms) so
-  // it's safe to call on every response.
-  persistStats();
-
-  // Persist to SessionDB so counters survive process restart, --continue,
-  // upgrade. Re-introduces the write path 4742160 added and b392c2f dropped.
-  // setImmediate keeps this off the response hot path; the helper itself
-  // is best-effort (never throws).
-  setImmediate(() => persistToolCallCounter(getSessionDbPath(), toolName, bytes));
-
-  // D2 Phase 5/7 — sandbox-execute event emission. Tracks the bytes the
-  // user actually saw from sandboxed runs so getRealBytesStats() can
-  // replace the conservative `events × 256` estimate. Best-effort and
-  // off the hot path, same shape as persistToolCallCounter above.
-  if (
-    toolName === "ctx_execute"
-    || toolName === "ctx_execute_file"
-    || toolName === "ctx_batch_execute"
-  ) {
-    setImmediate(() =>
-      emitSandboxExecuteEvent({
-        sessionDbPath: getSessionDbPath(),
-        toolName,
-        bytesReturned: bytes,
-      })
-    );
-  }
-
-  // Retrieval ("With context-mode") bridge — ctx_search / ctx_fetch_and_index
-  // response bytes are the kept-out content the model paid to access. The
-  // PostToolUse hook never fires for the plugin's OWN MCP tools, so the
-  // hook-side extractMcpToolCall can never see these calls (bytes_retrieved
-  // was 0/124454 in prod). Drop the count into a marker keyed by the session
-  // DB; the next ordinary-tool PostToolUse consumes it and emits a forwardable
-  // bytes_retrieved event. Off the hot path; never throws.
-  if (toolName === "ctx_search" || toolName === "ctx_fetch_and_index") {
-    setImmediate(() => appendRetrievalBytes(getSessionDbPath(), bytes));
-  }
-
+function trackResponse(_toolName: string, response: ToolResult): ToolResult {
   return response;
 }
 
-function trackIndexed(bytes: number, source: string = "unknown"): void {
-  sessionStats.bytesIndexed += bytes;
-  persistStats();
-  // D2 Phase 5/7 — index-write event emission. `bytes_avoided` because
-  // these are bytes that would have flooded context if the user had
-  // Read'd the source instead of indexing.
-  if (bytes > 0) {
-    setImmediate(() =>
-      emitIndexWriteEvent({
-        sessionDbPath: getSessionDbPath(),
-        source,
-        bytesAvoided: bytes,
-      })
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Stats persistence — written after every tool call so
-// external readers (status line scripts, dashboards, hooks)
-// can see real-time savings without spawning an MCP client.
-// ─────────────────────────────────────────────────────────
-
-const STATS_PERSIST_THROTTLE_MS = 500;
-// Schema version for the persisted stats payload (~/.claude/context-mode/sessions/stats-*.json).
-// Bump when a field is added/renamed/removed. Statusline reads `schemaVersion ?? 0` and warns when
-// it sees a future schema, so legacy bundles degrade gracefully on upgrade rather than silently
-// rendering missing fields (PR #401 architect review P1.3).
-// v2: added tokens_saved_lifetime + dollars_saved_lifetime.
-const STATS_SCHEMA_VERSION = 2;
-// pricePerToken() intentionally NOT defined here — single source in
-// src/session/analytics.ts re-exported above. (P1.1 — pricing constant dedup,
-// PR #401 architect + ops 2-vote convergence.)
-const LIFETIME_REFRESH_MS = 30_000;
-// Matches the conversion factor in src/session/analytics.ts renderBottomLine:
-// ~1KB per session event ÷ 4 bytes/token = 256 tokens/event.
-const TOKENS_PER_EVENT = 256;
-let _lastStatsPersist = 0;
-let _lifetimeCache: { tokens: number; computedAt: number } | undefined;
-
-/**
- * Resolve the per-session stats file path.
- *
- * The session id mirrors the Claude Code adapter contract
- * (`pid-<parent pid>`), so a status line script can derive
- * the same id from `$PPID` without coupling to MCP.
- */
-// CLAUDE_SESSION_ID flows from the hosting process (Claude Code, pi, etc.)
-// straight into a path.join, and path.join collapses ".." into the result,
-// so a host env CLAUDE_SESSION_ID=../../evil writes "stats-evil.json" two
-// levels above statsDir. The env var is not under direct MCP-tool-caller
-// control, but in CI / multi-tenant contexts where the host env is partly
-// influenceable this is an arbitrary-write primitive within the MCP server
-// process's filesystem permissions. Constrain to a UUID-shaped charset
-// before splicing into the stats filename.
-const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
-function sanitizeSessionId(raw: string): string {
-  return SESSION_ID_RE.test(raw) ? raw : `pid-${process.ppid}`;
-}
-
-function getStatsFilePath(): string {
-  const raw = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
-  const sessionId = sanitizeSessionId(raw);
-  const statsDir = ensureWritableStorageDir(resolveStatsStorageDir(getDefaultSessionDir));
-  return join(statsDir, `stats-${sessionId}.json`);
-}
-
-function persistStats(): void {
-  const now = Date.now();
-  if (now - _lastStatsPersist < STATS_PERSIST_THROTTLE_MS) return;
-  _lastStatsPersist = now;
-
-  try {
-    const totalReturned = Object.values(sessionStats.bytesReturned).reduce(
-      (a, b) => a + b,
-      0,
-    );
-    const totalCalls = Object.values(sessionStats.calls).reduce(
-      (a, b) => a + b,
-      0,
-    );
-    const keptOut =
-      sessionStats.bytesIndexed +
-      sessionStats.bytesSandboxed +
-      sessionStats.cacheBytesSaved;
-    const totalProcessed = keptOut + totalReturned;
-    const reductionPct =
-      totalProcessed > 0
-        ? Math.round((1 - totalReturned / totalProcessed) * 100)
-        : 0;
-    const tokensSaved = Math.round(keptOut / 4);
-
-    // Lifetime savings — cached separately because getLifetimeStats() scans
-    // disk (per-project SessionDBs + auto-memory dirs) and is too expensive
-    // for the 500ms persist throttle. Refresh every 30s; the statusline
-    // doesn't need second-by-second lifetime accuracy.
-    let lifetimeTokens = _lifetimeCache?.tokens ?? 0;
-    if (!_lifetimeCache || now - _lifetimeCache.computedAt > LIFETIME_REFRESH_MS) {
-      try {
-        const life = getLifetimeStats({ sessionsDir: getSessionDir() });
-        lifetimeTokens = (life?.totalEvents ?? 0) * TOKENS_PER_EVENT;
-        _lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
-      } catch {
-        // best-effort — keep stale cache or 0
-      }
-    }
-
-    const payload = {
-      schemaVersion: STATS_SCHEMA_VERSION,
-      version: VERSION,
-      updated_at: now,
-      session_start: sessionStats.sessionStart,
-      uptime_ms: now - sessionStats.sessionStart,
-      total_calls: totalCalls,
-      bytes_returned: totalReturned,
-      bytes_indexed: sessionStats.bytesIndexed,
-      bytes_sandboxed: sessionStats.bytesSandboxed,
-      cache_hits: sessionStats.cacheHits,
-      cache_bytes_saved: sessionStats.cacheBytesSaved,
-      kept_out: keptOut,
-      total_processed: totalProcessed,
-      reduction_pct: reductionPct,
-      tokens_saved: tokensSaved,
-      // statusline-facing $ values — pre-computed at the current per-token
-      // rate (dynamic when PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN is set by a
-      // Pi host; Opus $15/1M otherwise). Resolved on every persist via
-      // pricePerToken() so the env override picks up without an MCP restart.
-      dollars_saved_session: +(tokensSaved * pricePerToken()).toFixed(2),
-      tokens_saved_lifetime: lifetimeTokens,
-      dollars_saved_lifetime: +(lifetimeTokens * pricePerToken()).toFixed(2),
-      by_tool: Object.fromEntries(
-        Object.keys({ ...sessionStats.calls, ...sessionStats.bytesReturned }).map(
-          (t) => [
-            t,
-            {
-              calls: sessionStats.calls[t] || 0,
-              bytes: sessionStats.bytesReturned[t] || 0,
-            },
-          ],
-        ),
-      ),
-    };
-
-    const filePath = getStatsFilePath();
-    const tmpPath = `${filePath}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(payload));
-    renameSync(tmpPath, filePath);
-  } catch {
-    // best-effort — never break tool calls because of stats persistence
-  }
+function securityCheckFailed(toolName: string): ToolResult {
+  return trackResponse(toolName, {
+    content: [{ type: "text", text: "Security policy check failed; request blocked." }],
+    isError: true,
+  });
 }
 
 // ==============================================================================
@@ -1154,7 +276,7 @@ function checkDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     const result = evaluateCommandDenyOnly(command, policies);
     if (result.decision === "deny") {
       return trackResponse(toolName, {
@@ -1166,8 +288,7 @@ function checkDenyPolicy(
       });
     }
   } catch {
-    // Security check failed — allow through (fail-open for server,
-    // hooks are the primary enforcement layer)
+    return securityCheckFailed(toolName);
   }
   return null;
 }
@@ -1183,7 +304,7 @@ function checkNonShellDenyPolicy(
   try {
     const commands = extractShellCommands(code, language);
     if (commands.length === 0) return null;
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     for (const cmd of commands) {
       const result = evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
@@ -1197,7 +318,7 @@ function checkNonShellDenyPolicy(
       }
     }
   } catch {
-    // Fail-open
+    return securityCheckFailed(toolName);
   }
   return null;
 }
@@ -1205,22 +326,9 @@ function checkNonShellDenyPolicy(
 /**
  * Issue #852 — project-boundary containment for `ctx_execute_file`.
  *
- * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
- * user approving a `ctx_execute_file` call cannot see that its `path` escapes
- * the workspace. This guard refuses a `path` that resolves outside the project
- * root (absolute escape, `../` traversal, or symlink-out), restoring the
- * boundary the host believes it is enforcing.
- *
- * Escape hatch — NO bespoke opt-out env. A deliberate out-of-project read is
- * expressed in the SAME host config the user already maintains: a
- * `permissions.allow` rule like `Read(/var/log/**)`. This reuses the exact
- * mechanism Claude Code uses to whitelist a path outside its sandbox, so the
- * grant lives in one place and stays meaningful instead of rotting into a
- * context-mode-only env flag nobody sets.
- *
- * Fail-open on resolver failure (consistent with the other deny checks): if the
- * project root cannot be resolved, containment evaluates as "inside" and the
- * path is allowed through rather than spuriously blocking legitimate work.
+ * Refuses a path that resolves outside the configured project root (absolute
+ * escape, `../` traversal, or symlink-out). Explicit `Read(...)` allow rules
+ * remain the escape hatch for intentional out-of-project reads.
  */
 function checkProjectBoundary(
   filePath: string,
@@ -1244,7 +352,7 @@ function checkProjectBoundary(
       isError: true,
     });
   } catch {
-    // Fail-open — resolver failure must not block legitimate in-project work.
+    return securityCheckFailed(toolName);
   }
   return null;
 }
@@ -1276,17 +384,12 @@ function checkFilePathDenyPolicy(
       });
     }
   } catch {
-    // Fail-open
+    return securityCheckFailed(toolName);
   }
   return null;
 }
 
 // Build description dynamically based on detected runtimes
-const langList = available.join(", ");
-const bunNote = hasBunRuntime()
-  ? " (Bun detected — JS/TS runs 3-5x faster)"
-  : "";
-
 // ─────────────────────────────────────────────────────────
 // Helper: smart snippet extraction — returns windows around
 // matching query terms instead of dumb truncation
@@ -1531,15 +634,8 @@ function truncateCommandForEcho(command: string): string {
  * no-server-timer behavior there (Issue #406 — long builds need an unbounded
  * run). A caller can still pass an explicit `timeout` to override on any host.
  */
-export const AGY_DEFAULT_EXEC_TIMEOUT_MS = 120_000;
 export function resolveExecTimeout(timeout: number | undefined): number | undefined {
-  if (timeout !== undefined) return timeout;
-  // Only agy gets a default — every other host enforces its own RPC timeout, so
-  // keep the unbounded behavior there. Detected via the env the agy bundle pins
-  // (CONTEXT_MODE_PLATFORM=antigravity-cli). Tunable via CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS.
-  if (detectPlatform().platform !== "antigravity-cli") return undefined;
-  const override = Number(process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS);
-  return Number.isFinite(override) && override > 0 ? override : AGY_DEFAULT_EXEC_TIMEOUT_MS;
+  return timeout;
 }
 
 /**
@@ -1685,7 +781,7 @@ export async function runBatchCommands(
 // Tool: execute
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
+registerCtxTool(
   "ctx_execute",
   {
     // #852: surface code execution in the host approval prompt's title (the
@@ -1718,13 +814,11 @@ server.registerTool(
         .describe("Runtime language"),
       code: z
         .string()
-        .describe(
-          "Source code to execute. Use console.log (JS/TS), print (Python/Ruby/Perl/R), echo (Shell), echo (PHP), fmt.Println (Go), IO.puts (Elixir), or Console.WriteLine (C#) to output a summary to context.",
-        ),
+        .describe("Code to execute; print only the result that should enter context."),
       timeout: z
         .coerce.number()
         .optional()
-        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs (which is the right layer for this policy). Pass an explicit value for long-running builds (Gradle/Maven/SBT)."),
+        .describe("Max execution time in ms; omit to use the MCP host timeout."),
       // background: wrapped in coerceBoolean preprocessor so the literal
       // strings "true"/"false" arriving from OpenCode's native plugin
       // bridge (and several LLM providers' tool-call JSON) parse as the
@@ -1734,20 +828,15 @@ server.registerTool(
         .preprocess(coerceBoolean, z.boolean())
         .optional()
         .default(false)
-        .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
+        .describe("Keep the process running after timeout for servers or daemons."),
       cwd: z
         .string()
         .optional()
-        .describe("Optional working directory for shell commands. Non-shell languages still execute from their sandbox temp directory."),
+        .describe("Optional working directory for shell commands."),
       intent: z
         .string()
         .optional()
-        .describe(
-          "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "indexes output into knowledge base and returns section titles + previews — not full content. " +
-          "Use ctx_search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
-          "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
-        ),
+        .describe("Terms to match when large output is indexed."),
     }),
   },
   async ({ language, code, timeout, background, cwd, intent }) => {
@@ -1839,7 +928,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       // Parse sandbox network metrics from stderr
       const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
       if (netMatch) {
-        sessionStats.bytesSandboxed += parseInt(netMatch[1]);
         // Clean the metric line from stderr
         result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
       }
@@ -1847,7 +935,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       // Parse sandbox FS read metrics from stderr
       const fsMatch = result.stderr?.match(/__CM_FS__:(\d+)/);
       if (fsMatch) {
-        sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
       }
 
@@ -1891,7 +978,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
@@ -1901,7 +987,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
@@ -1921,7 +1006,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute", {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
@@ -1970,7 +1054,6 @@ function indexStdout(
   source: string,
 ): { content: Array<{ type: "text"; text: string }> } {
   const store = getStore();
-  trackIndexed(Buffer.byteLength(stdout));
   const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
   return {
     content: [
@@ -2049,7 +1132,7 @@ function intentSearch(
 // Tool: execute_file
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
+registerCtxTool(
   "ctx_execute_file",
   {
     // #852: the host's MCP approval prompt renders only the tool name/title +
@@ -2086,20 +1169,15 @@ server.registerTool(
         .describe("Runtime language"),
       code: z
         .string()
-        .describe(
-          "Code to process FILE_CONTENT (file_content in Elixir). Print summary via console.log/print/echo/IO.puts/Console.WriteLine.",
-        ),
+        .describe("Code that reads FILE_CONTENT and prints the result to return."),
       timeout: z
         .coerce.number()
         .optional()
-        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs."),
+        .describe("Max execution time in ms; omit to use the MCP host timeout."),
       intent: z
         .string()
         .optional()
-        .describe(
-          "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "returns only matching sections via BM25 search instead of truncated output.",
-        ),
+        .describe("Terms to match when large output is indexed."),
     }),
   },
   async ({ path, language, code, timeout, intent }) => {
@@ -2152,7 +1230,6 @@ server.registerTool(
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
@@ -2162,7 +1239,6 @@ server.registerTool(
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
@@ -2181,7 +1257,6 @@ server.registerTool(
       const stdout = result.stdout || "(no output)";
 
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute_file", {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
@@ -2224,7 +1299,7 @@ server.registerTool(
 // Tool: index
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
+registerCtxTool(
   "ctx_index",
   {
     title: "Index Content",
@@ -2247,9 +1322,7 @@ server.registerTool(
       path: z
         .string()
         .optional()
-        .describe(
-          "File OR directory path to read and index (content never enters context). Provide this OR content. Directory paths trigger a bounded recursive walk (#687).",
-        ),
+        .describe("File or directory path to index; provide this or content."),
       source: z
         .string()
         .optional()
@@ -2260,7 +1333,7 @@ server.registerTool(
         "Directory-only: glob patterns to include (default: all matching extensions).",
       ),
       exclude: z.array(z.string()).optional().describe(
-        "Directory-only: glob patterns to exclude. Merged with defaults (node_modules, .git, dist, build, .next, coverage, .venv, __pycache__, .DS_Store).",
+        "Directory globs to exclude; common build and vendor directories are skipped by default.",
       ),
       maxDepth: z.number().int().min(0).optional().describe(
         "Directory-only: max recursion depth from root (default: 5).",
@@ -2269,7 +1342,7 @@ server.registerTool(
         "Directory-only: hard cap on files indexed (default: 200) — FTS5 blow-up guard.",
       ),
       extensions: z.array(z.string()).optional().describe(
-        "Directory-only: allowed file extensions (default: .md .mdx .txt .json .yaml .yml .ts .tsx .js .jsx .py .rs .go .sh).",
+        "Allowed file extensions when indexing a directory.",
       ),
       respectGitignore: z.boolean().optional().describe(
         "Directory-only: apply nearest .gitignore (default: true).",
@@ -2379,14 +1452,6 @@ server.registerTool(
         });
       }
 
-      // Track the raw bytes being indexed (content or file)
-      if (content) trackIndexed(Buffer.byteLength(content));
-      else if (resolvedPath) {
-        try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
-        } catch { /* ignore — file read errors handled by store */ }
-      }
       const store = getStore();
       const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath, attribution: currentAttribution() });
 
@@ -2523,7 +1588,7 @@ function coerceCommandsArray(val: unknown): unknown {
   return arr;
 }
 
-server.registerTool(
+registerCtxTool(
   "ctx_search",
   {
     title: "Search Indexed Content",
@@ -2543,7 +1608,7 @@ server.registerTool(
       const sort = (params as Record<string, unknown>).sort as string || "relevance";
 
       // Guard: redirect when the index is empty — ctx_search is a follow-up
-      // tool that requires prior indexing. Skip for timeline mode (SessionDB/auto-memory may have data).
+      // tool that requires prior indexing. Skip for timeline mode (SessionDB may have data).
       if (sort !== "timeline" && store.getStats().chunks === 0) {
         return trackResponse("ctx_search", {
           content: [{
@@ -2635,7 +1700,7 @@ server.registerTool(
           if (existsSync(dbFile)) {
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
-        } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
+        } catch { /* SessionDB unavailable — search ContentStore only */ }
       }
 
       // Resolve the session-id allow-set once for the relevance-mode path —
@@ -2648,8 +1713,6 @@ server.registerTool(
           relevanceAllowSet = new Set(timelineDB.getSessionIdsForProject(projectScope));
         } catch { /* best-effort */ }
       }
-
-      const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigDir();
 
       try {
       for (const q of queryList) {
@@ -2669,8 +1732,6 @@ server.registerTool(
             contentType,
             sessionDB: timelineDB,
             projectDir: getProjectDir(),
-            configDir,
-            adapter: _detectedAdapter ?? undefined,
             projectScope,
           });
         } else {
@@ -3345,7 +2406,6 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
     indexed = store.index({ content: f.markdown, source: storageLabel, attribution });
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
-  trackIndexed(Buffer.byteLength(f.markdown));
   const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
     ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
     : f.markdown;
@@ -3357,7 +2417,7 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
   };
 }
 
-server.registerTool(
+registerCtxTool(
   "ctx_fetch_and_index",
   {
     title: "Fetch & Index URL(s)",
@@ -3374,9 +2434,7 @@ server.registerTool(
       source: z
         .string()
         .optional()
-        .describe(
-          "Label for the indexed content when using single `url` (e.g., 'React useEffect docs', 'Supabase Auth API'). For batch, put source in each requests entry.",
-        ),
+        .describe("Label for a single URL; batch requests can set their own source."),
       requests: z
         .preprocess(
           coerceJsonArray,
@@ -3388,10 +2446,7 @@ server.registerTool(
           ).min(1),
         )
         .optional()
-        .describe(
-          "Batch shape: array of {url, source?} entries. Use with concurrency>1 for parallel fetch. " +
-          "Each request indexed under its own source label. Output preserves input order.",
-        ),
+        .describe("Batch of {url, source?} entries."),
       concurrency: z
         .coerce.number()
         .int()
@@ -3399,12 +2454,7 @@ server.registerTool(
         .max(8)
         .optional()
         .default(1)
-        .describe(
-          "Max URLs to fetch in parallel (1-8, default: 1). " +
-          "Use 4-8 for I/O-bound multi-URL batches (library docs, changelogs, pricing pages). " +
-          "Capped by os.cpus().length on small machines (response notes when capped). " +
-          "Indexing is always serial regardless — only fetches race.",
-        ),
+        .describe("Parallel URL fetches, 1-8; indexing remains serial."),
       force: z
         .preprocess(coerceBoolean, z.boolean())
         .optional()
@@ -3414,10 +2464,7 @@ server.registerTool(
         .int()
         .min(0)
         .optional()
-        .describe(
-          "Override the cache freshness window for this call, in milliseconds. " +
-          "`ttl: 0` bypasses the cache like `force: true`; omit to use the default 24h TTL.",
-        ),
+        .describe("Cache TTL in ms; 0 bypasses cache."),
     }),
   },
   async ({ url, source, requests, concurrency, force, ttl }) => {
@@ -3469,29 +2516,12 @@ server.registerTool(
       }
       const v = r.value;
       if (v.kind === "cached") {
-        sessionStats.cacheHits++;
-        sessionStats.cacheBytesSaved += v.estimatedBytes;
-        // D2 Phase 5/7 — cache-hit event emission. `bytes_avoided` is the
-        // size of the cached payload that would have re-entered context
-        // had the TTL window missed. Best-effort, off the hot path.
-        const cachedBytes = v.estimatedBytes;
-        const cachedLabel = v.label;
-        setImmediate(() =>
-          emitCacheHitEvent({
-            sessionDbPath: getSessionDbPath(),
-            source: cachedLabel,
-            bytesAvoided: cachedBytes,
-          })
-        );
         finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr, ttlStr: v.ttlStr });
       } else if (v.kind === "fetch_error") {
         finalized.push({ kind: "fetch_error", url: v.url, error: v.error, reason: v.reason });
       } else {
         // Serial FTS5 write here — no parallel store.index calls.
-        // Cache miss: the URL was not in the TTL window so we paid the
-        // network round-trip + re-indexed. Counted here so ctx_stats can
-        // report nominal cache_hit_rate alongside the existing hit metrics.
-        sessionStats.cacheMisses++;
+        // Cache miss: fetch and index the content.
         finalized.push({ kind: "fetched", indexed: indexFetched(v) });
       }
     }
@@ -3603,7 +2633,7 @@ server.registerTool(
 // Tool: batch_execute
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
+registerCtxTool(
   "ctx_batch_execute",
   {
     title: "Batch Execute & Search",
@@ -3630,22 +2660,15 @@ server.registerTool(
           }),
         )
         .min(1)
-        .describe(
-          "Commands to execute as a batch. Output is labeled with the section header. " +
-          "Default order is sequential; pass concurrency>1 to run in parallel (output stays in input order).",
-        )),
+        .describe("Commands to run; labels become indexed section headers.")),
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
         .min(1)
-        .describe(
-          "Search queries to extract information from indexed output. Use 5-8 comprehensive queries. " +
-          "Each returns top 5 matching sections with full content. " +
-          "This is your ONLY chance — put ALL your questions here. No follow-up calls needed.",
-        )),
+        .describe("Queries to extract from indexed batch output.")),
       timeout: z
         .coerce.number()
         .optional()
-        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs. With concurrency=1, the value (when set) is a shared budget across commands; with concurrency>1, it is applied per-command."),
+        .describe("Max execution time in ms per batch or command."),
       concurrency: z
         .coerce.number()
         .int()
@@ -3653,13 +2676,7 @@ server.registerTool(
         .max(8)
         .optional()
         .default(1)
-        .describe(
-          "Max commands to run in parallel (1-8, default: 1). " +
-          "Use 4-8 for I/O-bound batches (network, gh, curl, multi-repo git reads). " +
-          "Keep at 1 for CPU-bound (npm test, build, lint) or stateful commands (ports, locks). " +
-          ">1 switches to per-command timeouts (no shared budget) and " +
-          "individual `(timed out)` blocks instead of cascading skip.",
-        ),
+        .describe("Parallel commands, 1-8; use 1 for stateful or CPU-bound work."),
       cwd: z
         .string()
         .optional()
@@ -3668,14 +2685,7 @@ server.registerTool(
         .enum(["batch", "global"])
         .optional()
         .default("batch")
-        .describe(
-          "Scope for `queries` (default: `batch`). " +
-          "`batch` searches ONLY the chunks produced by this batch's commands " +
-          "— useful when you want answers about the just-fetched output. " +
-          "`global` searches the entire persistent index (same scope as ctx_search) " +
-          "— useful when you want the batch commands to enrich context and " +
-          "the queries to also surface related prior knowledge in one round trip.",
-        ),
+        .describe("'batch' searches this call; 'global' searches the full index."),
     }),
   },
   async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
@@ -3701,7 +2711,6 @@ server.registerTool(
           concurrency,
           nodeOptsPrefix,
           cwd,
-          onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
         },
         executor,
       );
@@ -3723,12 +2732,11 @@ server.registerTool(
       }
 
       // Track indexed bytes (raw data that stays in sandbox)
-      trackIndexed(totalBytes);
 
       // Index into knowledge base — markdown heading chunking splits by # labels
       const store = getStore();
       const source = `batch:${commands
-        .map((c) => c.label)
+        .map((c: { label: string; command: string }) => c.label)
         .join(",")
         .slice(0, 80)}`;
       const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
@@ -3800,532 +2808,56 @@ server.registerTool(
  * in stats-*.json files instead of the default events × 256 heuristic.
  * Only active for Pi adapter — other platforms use getLifetimeStats() as-is.
  */
-function patchPiLifetimeFromStatsFiles(lifetime: ReturnType<typeof getLifetimeStats>, sessionsDir: string): void {
-  if (!existsSync(sessionsDir)) return;
-  let sandboxedBytes = 0;
-  try {
-    for (const f of readdirSync(sessionsDir)) {
-      if (!f.startsWith("stats-") || !f.endsWith(".json")) continue;
-      try {
-        const raw = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8"));
-        sandboxedBytes += (raw?.bytes_sandboxed ?? 0) + (raw?.bytes_indexed ?? 0);
-      } catch { /* corrupt file — skip */ }
-    }
-  } catch { /* never block ctx_stats on stats file I/O */ }
-  if (sandboxedBytes > 0) {
-    const rescueTokens = (lifetime.rescueBytes ?? 0) / 4;
-    lifetime.totalEvents = Math.round((sandboxedBytes / 4 + rescueTokens) / 256);
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Tool: stats
-// ─────────────────────────────────────────────────────────
-
-/**
- * Create a minimal in-memory DB adapter for when the session DB is unavailable.
- * All queries return empty results so AnalyticsEngine.queryAll() still works.
- */
-function createMinimalDb(): import("./session/analytics.js").DatabaseAdapter {
-  return {
-    prepare: () => ({
-      run: () => undefined,
-      get: (..._args: unknown[]) => ({ cnt: 0, compact_count: 0, minutes: null, rate: 0, avg: 0, outcome: "exploratory" }),
-      all: () => [],
-    }),
-  };
-}
-
-server.registerTool(
-  "ctx_stats",
-  {
-    title: "Session Statistics",
-    // #846: read-only diagnostics. Was cancelled by Codex when unannotated.
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    description:
-      "Returns context consumption statistics for the current session. " +
-      "Shows total bytes returned to context, breakdown by tool, call counts, " +
-      "estimated token usage, and context savings ratio.",
-    inputSchema: z.object({}),
-  },
-  async () => {
-    // ONE call, ONE source — AnalyticsEngine.queryAll()
-    let text: string;
-    try {
-      const projectDir = getProjectDir();
-      // Canonical hash + migration-aware path. The downstream
-      // getConversationStats / getRealBytesStats reconstruct the DB
-      // filename from worktreeHash; pass the SAME canonical hash that
-      // resolveSessionDbPath used so they hit the same file.
-      const dbHash = hashProjectDirCanonical(projectDir);
-      const sessionDbPath = resolveSessionDbPath({
-        projectDir,
-        sessionsDir: getSessionDir(),
-      });
-
-      if (existsSync(sessionDbPath)) {
-        const Database = loadDatabase();
-        const sdb = new Database(sessionDbPath, { readonly: true });
-        try {
-          const engine = new AnalyticsEngine(sdb);
-          const report = engine.queryAll(sessionStats);
-          // MCP usage is read-only and cheap; only available when DB exists.
-          const mcpUsage = engine.getMcpToolUsage();
-          // Lifetime stats span every project's SessionDB + auto-memory dir
-          // (Bugs #3/#4); failures are absorbed inside getLifetimeStats so a
-          // corrupt sidecar can never break ctx_stats.
-          // B3b Slice 3.1: scope to active adapter via getSessionDir() so
-          // non-Claude platforms (Cursor, OpenCode, JetBrains, ...) read
-          // from THEIR sessions dir — not the hardcoded ~/.claude/ default.
-          // Mirrors the statusline contract at src/server.ts:540.
-          const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
-          // B3b Slices 3.2-3.6: cross-adapter aggregation so the renderer
-          // can show "Where it came from" + the "across N AI tools"
-          // headline. Best-effort — failures absorbed so a corrupt
-          // sidecar in any adapter dir cannot break ctx_stats.
-          let multiAdapter;
-          try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
-          // F1: wire conversation + realBytes opts so formatReport renders the
-          // narrative 5-section "kitap gibi" layout (timeline, ladder, receipt,
-          // example cost, auto-memory). Without these, formatReport falls back
-          // to the legacy active-session header. Best-effort — failures absorbed.
-          // Resolve session_id: prefer env (CLAUDE_SESSION_ID), else most-recent
-          // UUID session_id from session_events in this DB.
-          let conversation;
-          let realBytes;
-          try {
-            let sid = process.env.CLAUDE_SESSION_ID;
-            if (!sid) {
-              const row = sdb.prepare(
-                "SELECT session_id FROM session_events WHERE session_id LIKE '________-____-____-____-____________' ORDER BY created_at DESC LIMIT 1"
-              ).get() as { session_id: string } | undefined;
-              sid = row?.session_id;
-            }
-            if (sid) {
-              conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
-              // v1.0.133 Slice 3: pass contentDbPath so getRealBytesStats can
-              // join chunks WHERE session_id = sid and fold the indexed
-              // content bytes into the per-conversation bar. Without this,
-              // Mert's session showed ~200B (event metadata only) even with
-              // 49 MB of indexed content sitting in the content DB.
-              // Render-time read-only — no DB mutation, no backfill.
-              const contentDbPath = getStorePath();
-              // v1.0.148 Bug E+F: a conversation typically spans many
-              // session_ids (resume cycles, /compact rebirths, PID
-              // sub-process sessions launched by ctx_execute). Scoping
-              // per-session loses sandbox-burst bytes_avoided that the
-              // PID-sessions own. Look up THIS session's project_dir
-              // from META and aggregate via META subquery so all
-              // sibling sessions in the same cwd attribute together.
-              // Fallback to sessionId scope if the META lookup fails
-              // (best-effort — the original metric is still defensible).
-              let convReal;
-              try {
-                const Database = loadDatabase();
-                const dbFiles = (await import("node:fs"))
-                  .readdirSync(getSessionDir())
-                  .filter((f) => f.endsWith(".db") && (!dbHash || f.startsWith(dbHash)));
-                let projectDirForSid: string | undefined;
-                for (const file of dbFiles) {
-                  try {
-                    const sdb = new Database(
-                      (await import("node:path")).join(getSessionDir(), file),
-                      { readonly: true },
-                    );
-                    try {
-                      const r = sdb
-                        .prepare("SELECT project_dir FROM session_meta WHERE session_id = ?")
-                        .get(sid) as { project_dir: string } | undefined;
-                      if (r?.project_dir) {
-                        projectDirForSid = r.project_dir;
-                        break;
-                      }
-                    } finally {
-                      sdb.close();
-                    }
-                  } catch { /* skip unreadable DB */ }
-                }
-                // Section 1 "Where you are now" = the LIVE conversation window.
-                // Sub-agents + ctx_execute sub-process sessions write to this
-                // SAME worktree DB (same worktreeHash = sha256(cwd)) under their
-                // own session_ids; their retrieval hit their own disposable
-                // windows, not yours. getConversationWindowStats credits the
-                // whole worktree's kept-out bytes while counting only THIS
-                // session's retrieval as "With context-mode", and the
-                // worktreeHash scope keeps the user's OTHER parallel worktrees
-                // out. projectDirForSid is intentionally dropped — it
-                // under-counted (missed empty-project_dir sub-process sessions)
-                // and could not separate sub-agent retrieval from the window's.
-                void projectDirForSid;
-                convReal = getConversationWindowStats({ sessionId: sid, worktreeHash: dbHash, sessionsDir: getSessionDir(), contentDbPath });
-              } catch {
-                convReal = getConversationWindowStats({ sessionId: sid, worktreeHash: dbHash, sessionsDir: getSessionDir(), contentDbPath });
-              }
-              const lifeRealBase = getRealBytesStats({ sessionsDir: getSessionDir() });
-              // v1.0.134 SLICE C: lifetime tier sums ALL chunks (no
-              // session_id filter). Without this fold, lifetime "kept out"
-              // only counts session_events.bytes_avoided and ignores the
-              // bulk of indexed payload across every prior conversation.
-              const lifeContentBytes = getContentBytesAllSessions(contentDbPath);
-              const lifeReal = {
-                ...lifeRealBase,
-                contentBytes: lifeRealBase.contentBytes + lifeContentBytes,
-                bytesAvoided: lifeRealBase.bytesAvoided + lifeContentBytes,
-                totalSavedTokens: Math.floor(
-                  (lifeRealBase.eventDataBytes
-                    + lifeRealBase.bytesAvoided
-                    + lifeContentBytes
-                    + lifeRealBase.snapshotBytes) / 4,
-                ),
-              };
-              realBytes = { conversation: convReal, lifetime: lifeReal };
-            }
-          } catch { /* never block ctx_stats */ }
-          // Pi byte accounting: patch lifetime from stats-*.json files
-          // (actual bytes_sandboxed, not events × 256 heuristic).
-          if (_detectedAdapter?.name === "Pi") {
-            patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
-          }
-          // v1.0.117: pass projectDir as cwd so the narrative renderer's
-          // "started in <path>" line matches the user's actual project.
-          // Snapshot the persistent store so the renderer can show
-          // total_chunks / last_indexed_at without callers having to query
-          // separately. Best-effort — getStore() is process-local and may
-          // be unavailable on cold paths; failures are absorbed.
-          let indexState;
-          try { indexState = getStore().getIndexState(); } catch { /* never block ctx_stats */ }
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, indexState, cwd: projectDir });
-        } finally {
-          sdb.close();
-        }
-      } else {
-        // No session DB — build a minimal report from runtime stats only.
-        // Lifetime still meaningful (other projects, auto-memory) so include it.
-        const engine = new AnalyticsEngine(createMinimalDb());
-        const report = engine.queryAll(sessionStats);
-        const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
-        if (_detectedAdapter?.name === "Pi") {
-          patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
-        }
-        let multiAdapter;
-        try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
-        let indexState;
-        try { indexState = getStore().getIndexState(); } catch { /* never block ctx_stats */ }
-        text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter, indexState });
-      }
-    } catch {
-      // Session DB not available or incompatible — build minimal report from runtime stats
-      const engine = new AnalyticsEngine(createMinimalDb());
-      const report = engine.queryAll(sessionStats);
-      let lifetime;
-      try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
-      if (_detectedAdapter?.name === "Pi" && lifetime) {
-        patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
-      }
-      let multiAdapter;
-      try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
-      text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
-    }
-
-    return trackResponse("ctx_stats", {
-      content: [{ type: "text" as const, text }],
-    });
-  },
-);
-
 // ── ctx-doctor: diagnostics (server-side) ─────────────────────────────────
-server.registerTool(
+registerCtxTool(
   "ctx_doctor",
   {
     title: "Run Diagnostics",
-    // #846: read-only diagnostics (runs an internal self-test, mutates nothing).
-    // Was cancelled by Codex when unannotated.
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: "Diagnose context-mode and return a plain-text [OK]/[WARN]/[FAIL] status report.",
     inputSchema: z.object({}),
   },
   async () => {
-    // Renderer-safe output (Mickey #3 — Z.ai GLM 4.7 ReferenceError):
-    // Z.ai's MCP renderer mounts a custom React component for GitHub-flavored
-    // markdown task-list syntax (`- [x]` / `- [ ]` / `- [-]`) that depends on
-    // a missing `client` context, throwing `ReferenceError: client is not
-    // defined`. We avoid both task-list syntax AND `## ` h2 headings to stay
-    // safe across all MCP renderers — using plain-text status prefixes
-    // (`[OK]` / `[FAIL]` / `[WARN]`) instead.
     const lines: string[] = ["context-mode doctor", ""];
-    let currentPlatform: PlatformId | undefined;
-    try {
-      currentPlatform = detectPlatform(server.server.getClientVersion() ?? undefined).platform;
-    } catch {
-      currentPlatform = detectPlatform().platform;
-    }
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root.
-    // Codex is special: when plugin-manager runtime root differs from the
-    // current package root, diagnose the root Codex will actually execute.
-    const pluginRoot = getRuntimeAwarePackageRoot(currentPlatform);
-
-    // Runtimes
-    const total = 11;
-    const pct = ((available.length / total) * 100).toFixed(0);
-    lines.push(`[OK] Runtimes: ${available.length}/${total} (${pct}%) — ${available.join(", ")}`);
-
-    // Performance
-    if (hasBunRuntime()) {
-      lines.push("[OK] Performance: FAST (Bun)");
-    } else {
-      lines.push("[WARN] Performance: NORMAL — install Bun for 3-5x speed boost");
-    }
+    lines.push(`[OK] Runtimes: ${available.length} — ${available.join(", ")}`);
 
     const sessionStorage = resolveSessionStorageDir(getDefaultSessionDir);
     const contentStorage = resolveContentStorageDir(getDefaultSessionDir);
-    const statsStorage = resolveStatsStorageDir(getDefaultSessionDir);
-    lines.push(`[OK] Storage sessions: ${sessionStorage.path} (${describeStorageDirectorySource(sessionStorage)})`);
-    lines.push(`[OK] Storage content: ${contentStorage.path} (${describeStorageDirectorySource(contentStorage)})`);
-    lines.push(`[OK] Storage stats: ${statsStorage.path} (${describeStorageDirectorySource(statsStorage)})`);
+    lines.push(`[OK] Storage sessions: ${sessionStorage.path}`);
+    lines.push(`[OK] Storage content: ${contentStorage.path}`);
 
-    // Server test — cleanup executor to prevent resource leaks (#247)
-    {
-      const testExecutor = new PolyglotExecutor({ runtimes });
-      try {
-        const result = await testExecutor.execute({ language: "javascript", code: 'console.log("ok");', timeout: 5000 });
-        if (result.exitCode === 0 && result.stdout.trim() === "ok") {
-          lines.push("[OK] Server test: PASS");
-        } else {
-          const detail = result.stderr?.trim() ? ` (${result.stderr.trim().slice(0, 200)})` : "";
-          lines.push(`[FAIL] Server test: FAIL — exit ${result.exitCode}${detail}`);
-        }
-      } catch (err: unknown) {
-        lines.push(`[FAIL] Server test: FAIL — ${err instanceof Error ? err.message : err}`);
-      } finally {
-        testExecutor.cleanupBackgrounded();
-      }
+    const testExecutor = new PolyglotExecutor({ runtimes });
+    try {
+      const result = await testExecutor.execute({ language: "javascript", code: 'console.log("ok");', timeout: 5000 });
+      lines.push(result.exitCode === 0 && result.stdout.trim() === "ok"
+        ? "[OK] Executor: PASS"
+        : `[FAIL] Executor: exit ${result.exitCode}`);
+    } catch (err) {
+      lines.push(`[FAIL] Executor: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      testExecutor.cleanupBackgrounded();
     }
 
-    // FTS5 / SQLite — close in finally to prevent GC segfault (#247)
-    {
-      let testDb: ReturnType<typeof loadDatabase> extends (...args: any[]) => infer R ? R : never;
-      try {
-        const Database = loadDatabase();
-        testDb = new Database(":memory:");
-        testDb.exec("CREATE VIRTUAL TABLE fts_test USING fts5(content)");
-        testDb.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
-        const row = testDb.prepare("SELECT * FROM fts_test WHERE fts_test MATCH 'hello'").get() as { content: string } | undefined;
-        if (row && row.content === "hello world") {
-          lines.push("[OK] FTS5 / SQLite: PASS — native module works");
-        } else {
-          lines.push("[FAIL] FTS5 / SQLite: FAIL — unexpected result");
-        }
-      } catch (err: unknown) {
-        lines.push(`[FAIL] FTS5 / SQLite: FAIL — ${err instanceof Error ? err.message : err}`);
-      } finally {
-        try { testDb!?.close(); } catch { /* best effort */ }
-      }
+    let testDb: any;
+    try {
+      const Database = loadDatabase();
+      testDb = new Database(":memory:");
+      testDb.exec("CREATE VIRTUAL TABLE fts_test USING fts5(content)");
+      testDb.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
+      const row = testDb.prepare("SELECT content FROM fts_test WHERE fts_test MATCH 'hello'").get() as { content?: string } | undefined;
+      lines.push(row?.content === "hello world" ? "[OK] FTS5 / SQLite: PASS" : "[FAIL] FTS5 / SQLite: unexpected result");
+    } catch (err) {
+      lines.push(`[FAIL] FTS5 / SQLite: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      try { testDb?.close(); } catch {}
     }
 
-    // Hooks
-    const diagnosticAdapter = await getDiagnosticAdapter();
-    if (diagnosticAdapter) {
-      for (const result of diagnosticAdapter.validateHooks(pluginRoot)) {
-        const prefix = result.status === "pass" ? "[OK]" : result.status === "warn" ? "[WARN]" : "[FAIL]";
-        const fix = result.fix ? ` — fix: ${result.fix}` : "";
-        lines.push(`${prefix} ${result.check}: ${result.message}${fix}`);
-      }
-
-      const hookScriptPaths = getHookScriptPaths(diagnosticAdapter, pluginRoot);
-      if (hookScriptPaths.length === 0) {
-        lines.push("[OK] Hook scripts: no direct .mjs script paths to verify");
-      }
-      for (const scriptPath of hookScriptPaths) {
-        const hookPath = resolve(pluginRoot, scriptPath);
-        if (existsSync(hookPath)) {
-          lines.push(`[OK] Hook script: PASS — ${hookPath}`);
-        } else {
-          lines.push(`[FAIL] Hook script: FAIL — not found at ${hookPath}`);
-        }
-      }
-    } else {
-      lines.push("[WARN] Hooks: adapter detection unavailable");
-    }
-
-    // Version
     lines.push(`[OK] Version: v${VERSION}`);
-
-    return trackResponse("ctx_doctor", {
-      content: [{ type: "text" as const, text: lines.join("\n") }],
-    });
+    return trackResponse("ctx_doctor", { content: [{ type: "text" as const, text: lines.join("\n") }] });
   },
 );
 
-// ── ctx-upgrade: upgrade meta-tool ─────────────────────────────────────────
-server.registerTool(
-  "ctx_upgrade",
-  {
-    title: "Upgrade Plugin",
-    // #846: an action tool (returns an upgrade command to run); not read-only,
-    // but non-destructive and idempotent. No direct network from the call.
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    description:
-      "Upgrade context-mode to the latest version. Returns a shell command to execute. " +
-      "You MUST run the returned command using your shell tool (Bash, shell_execute, " +
-      "run_in_terminal, etc.) and display the output as a checklist. " +
-      "Tell the user to restart their session after upgrade.",
-    inputSchema: z.object({}),
-  },
-  async () => {
-    // Issue #542 — thread MCP clientInfo into the spawned upgrade
-    // process. detectPlatform() runs IN-PROCESS here (no spawn boundary)
-    // so clientInfo from the MCP handshake is the highest-confidence
-    // signal available. We forward the resolved PlatformId as a
-    // --platform flag (cross-shell safe on POSIX, Git Bash, PowerShell,
-    // and cmd.exe — unlike env-var prefixes). If detection fails we
-    // skip the flag and let upgrade()'s own detectPlatform() fall back.
-    let platformFlag = "";
-    let nodeOpts: { platform: string; jsRuntime: string } | undefined =
-      undefined;
-    let platformId: PlatformId | undefined;
-    try {
-      const clientInfo = server.server.getClientVersion();
-      const signal = detectPlatform(clientInfo ?? undefined);
-      platformId = signal.platform;
-      platformFlag = ` --platform ${signal.platform}`;
-      nodeOpts = isInProcessPluginPlatform(signal.platform) && runtimes.javascript
-        ? { platform: signal.platform, jsRuntime: runtimes.javascript }
-        : undefined;
-    } catch {
-      try { platformId = detectPlatform().platform; } catch { /* best effort — fall back to upgrade()'s own detect */ }
-    }
-
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root.
-    // Only Codex may replace it with the plugin-manager runtime root; other
-    // adapters can coexist with Codex on the same machine.
-    const pluginRoot = getRuntimeAwarePackageRoot(platformId);
-    const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
-    const fallbackPath = resolve(pluginRoot, "build", "cli.js");
-
-    // Insight pivoted to the hosted dashboard (context-mode.com/insight), so
-    // ctx_insight no longer builds a local cache. On upgrade, sweep the legacy
-    // insight-cache and stop any stale local dashboard left from old versions.
-    try {
-      const sessDir = getSessionDir();
-      const insightCacheDir = join(dirname(sessDir), "insight-cache");
-      if (existsSync(insightCacheDir)) {
-        // Kill any running insight server first via the shared helper —
-        // this is locale-independent on Windows (PR #469) and isolates per-pid
-        // failures. We ignore the structured result: cache cleanup is
-        // best-effort and must never block ctx_upgrade.
-        killProcessOnPort(4747);
-        rmSync(insightCacheDir, { recursive: true, force: true });
-      }
-    } catch { /* best effort — don't block upgrade */ }
-
-
-    let cmd: string;
-
-    if (existsSync(bundlePath)) {
-      cmd = `${buildNodeCommand(bundlePath, nodeOpts)} upgrade${platformFlag}`;
-    } else if (existsSync(fallbackPath)) {
-      cmd = `${buildNodeCommand(fallbackPath, nodeOpts)} upgrade${platformFlag}`;
-    } else {
-      // Inline fallback: neither CLI file exists (e.g. marketplace installs).
-      // Generate a self-contained node -e script that performs the upgrade.
-      const repoUrl = "https://github.com/mksglu/context-mode.git";
-      // Write inline script to a temp .mjs file — avoids quote-escaping issues
-      // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
-      const scriptLines = [
-        `import{execFileSync}from"node:child_process";`,
-        `import{cpSync,rmSync,existsSync,mkdtempSync,readFileSync,writeFileSync,lstatSync}from"node:fs";`,
-        `import{join,resolve,sep}from"node:path";`,
-        `import{tmpdir}from"node:os";`,
-        `const P=${JSON.stringify(pluginRoot)};`,
-        `const T=mkdtempSync(join(tmpdir(),"ctx-upgrade-"));`,
-        `try{`,
-        `console.log("- [x] Starting inline upgrade (no CLI found)");`,
-        `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
-        `console.log("- [x] Cloned latest source");`,
-        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
-        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["run","build"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
-        `console.log("- [x] Built from source");`,
-        `const pkg=JSON.parse(readFileSync(join(T,"package.json"),"utf8"));`,
-        `const items=[...(Array.isArray(pkg.files)?pkg.files:[]),"src","package.json"];`,
-        // Supply-chain containment on items[]. Mirror the cli.ts upgrade()
-        // guard: a compromised upstream package.json with files:["../etc"]
-        // would otherwise let path.join follow ".." out of pluginRoot.
-        // path.resolve normalizes "..", so the lexical startsWith catches
-        // both relative-".." traversal and absolute-path bypass. Plus a
-        // symlink filter so a committed symlink inside the clone can't
-        // plant itself in pluginRoot (cpSync default preserves source
-        // symlinks; a planted symlink in pluginRoot/src then redirects
-        // every subsequent load through to an attacker target).
-        `const PW=resolve(P)+sep;const TW=resolve(T)+sep;`,
-        `const noSymlink=(src)=>{try{return !lstatSync(src).isSymbolicLink()}catch{return false}};`,
-        `for(const item of items){const from=resolve(T,item);const to=resolve(P,item);if(!(to+sep).startsWith(PW))continue;if(!(from+sep).startsWith(TW))continue;if(!noSymlink(from))continue;if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true,filter:noSymlink});}}`,
-        // Issue #609: do NOT write .mcp.json into the cache dir. Claude Code reads
-        // .claude-plugin/plugin.json.mcpServers as the canonical MCP source — the
-        // per-version .mcp.json file is a stale-write vector. Same architectural
-        // fix as the cli.ts upgrade() path; both writers were the only producers.
-        `console.log("- [x] Copied package files");`,
-        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
-        `console.log("- [x] Installed production dependencies");`,
-        `console.log("## context-mode upgrade complete");`,
-        `}catch(e){`,
-        `console.error("- [ ] Upgrade failed:",e.message);`,
-        `process.exit(1);`,
-        `}finally{`,
-        `try{rmSync(T,{recursive:true,force:true})}catch{}`,
-        `}`,
-      ].join("\n");
-
-      // Server writes the temp script file — avoids shell quoting issues entirely
-      const tmpScript = resolve(pluginRoot, ".ctx-upgrade-inline.mjs");
-      const { writeFileSync: writeTmp } = await import("node:fs");
-      writeTmp(tmpScript, scriptLines);
-      cmd = buildNodeCommand(tmpScript, nodeOpts);
-    }
-
-    const text = [
-      "## ctx-upgrade",
-      "",
-      "Run this command using your shell execution tool:",
-      "",
-      "```",
-      cmd,
-      "```",
-      "",
-      "After the command completes, display results as a markdown checklist:",
-      "- `[x]` for success, `[ ]` for failure",
-      "- Example format:",
-      "  ```",
-      "  ## context-mode upgrade",
-      "  - [x] Pulled latest from GitHub",
-      "  - [x] Built and installed v0.9.24",
-      "  - [x] npm global updated",
-      "  - [x] Hooks configured",
-      "  - [x] Doctor: all checks PASS",
-      "  ```",
-      "- Tell the user to restart their session to pick up the new version.",
-    ].join("\n");
-
-    return trackResponse("ctx_upgrade", {
-      content: [{ type: "text" as const, text }],
-    });
-  },
-);
-
+// ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
 // ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
 //
 // Issue #520 — scoped purge.
@@ -4342,7 +2874,7 @@ server.registerTool(
 // has no `.shape`, so the SDK silently emits `properties: {}`, and Claude
 // Code's strict-input-validation gate then rejects EVERY call to this
 // tool with "input_schema does not support fields". Issue #563.
-server.registerTool(
+registerCtxTool(
   "ctx_purge",
   {
     title: "Purge Knowledge Base",
@@ -4364,15 +2896,9 @@ server.registerTool(
         "MUST be true. Destructive operation; false returns 'purge cancelled'."
       ),
       sessionId: z.string().optional().describe(
-        "UUID of a single session. Pairs with confirm:true to wipe only that " +
-        "session's events + per-session FTS5 chunks. Sibling sessions and the " +
-        "stats file are preserved. MUST NOT be combined with scope:'project'."
+        "Session UUID; cannot be combined with scope:'project'."
       ),
-      scope: z.enum(["session", "project"]).optional().describe(
-        "Explicit scope selector. 'session' REQUIRES sessionId. 'project' wipes " +
-        "the entire project (FTS5 + every session + stats). Omit only for the " +
-        "deprecated bare-{confirm:true} back-compat path."
-      ),
+      scope: z.enum(["session", "project"]).optional().describe("Scope selector."),
     }),
   },
   async ({ confirm, sessionId, scope }) => {
@@ -4448,28 +2974,6 @@ server.registerTool(
       sessionId,
     });
 
-    // Stats are PROJECT-scoped (one stats file per project, summing all
-    // sessions). A scoped per-session purge MUST leave stats alone — they
-    // still belong to other sessions in the same project. Stats reset
-    // happens ONLY when scope === "project".
-    if (effectiveScope === "project") {
-      // Reset in-memory session stats
-      sessionStats.calls = {};
-      sessionStats.bytesReturned = {};
-      sessionStats.bytesIndexed = 0;
-      sessionStats.bytesSandboxed = 0;
-      sessionStats.cacheHits = 0;
-      sessionStats.cacheBytesSaved = 0;
-      sessionStats.sessionStart = Date.now();
-      deleted.push("session stats");
-
-      // Also drop the persisted stats file so external readers see a fresh state
-      try {
-        const statsFile = getStatsFilePath();
-        if (existsSync(statsFile)) unlinkSync(statsFile);
-      } catch { /* best effort */ }
-    }
-
     const message = effectiveScope === "session"
       ? `Purged session ${sessionId}: ${deleted.length ? deleted.join(", ") : "no matching rows"}. ` +
         `Other sessions and project-wide stats preserved.`
@@ -4483,380 +2987,42 @@ server.registerTool(
   },
 );
 
-// ── ctx_insight process helpers ──────────────────────────────────────────────
-// Cross-platform process helpers used by ctx_insight (below) and the dashboard
-// launcher in cli.ts. All entry points use argv arrays — never `sh -c <string>`
-// — so caller-derived values cannot escape into shell context. See issue #441.
-//
-// `browserOpenArgv` is duplicated as a private 16-LOC copy in cli.ts to avoid
-// pulling server.ts top-level boot side effects into the cli bundle.
-
-export type SpawnSyncFn = (
-  cmd: string,
-  args: readonly string[],
-  opts?: SpawnSyncOptions,
-) => SpawnSyncReturns<string | Buffer>;
-
-export type BrowserOpenResult =
-  | { ok: true; method: string }
-  | { ok: false; method: "none"; reason: string };
-
-export type KillResult = {
-  killedPids: string[];
-  attemptedPids: string[];
-  errors: string[];
-};
-
-// Hard upper bound on every helper-internal spawnSync call. Caps tail-latency
-// when an external binary hangs (xdg-open waiting for an X11 session, lsof
-// stalling on /proc, taskkill blocking on an unresponsive process, etc.) so
-// the MCP tool surfaces a diagnostic instead of blocking the agent loop.
-// 5s is comfortably above the 99th-percentile completion of every command we
-// invoke; anything past that is hung.
-const HELPER_SPAWN_TIMEOUT_MS = 5000;
-
-// Returns the argv attempts for opening `url` on `platform`, in fall-back order.
-// Pure data — no I/O.
-export function browserOpenArgv(
-  url: string,
-  platform: NodeJS.Platform,
-): readonly { cmd: string; args: readonly string[] }[] {
-  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
-  if (platform === "win32") {
-    // `start` is a cmd.exe builtin; the empty title arg ("") prevents the URL
-    // from being consumed as the window title.
-    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
-  }
-  // linux/bsd: try xdg-open, then sensible-browser (Debian/Ubuntu).
-  return [
-    { cmd: "xdg-open", args: [url] },
-    { cmd: "sensible-browser", args: [url] },
-  ];
-}
-
-// Opens a browser synchronously, waiting for each attempt to complete.
-// Returns a structured result so callers can surface auto-open failures
-// to the user instead of falsely reporting success.
-export function openBrowserSync(
-  url: string,
-  platform: NodeJS.Platform = process.platform,
-  runner: SpawnSyncFn = spawnSync,
-): BrowserOpenResult {
-  const attempts = browserOpenArgv(url, platform);
-  const errors: string[] = [];
-  for (const { cmd, args } of attempts) {
-    try {
-      const r = runner(cmd, args, { stdio: "ignore", timeout: HELPER_SPAWN_TIMEOUT_MS });
-      // Treat signal-kill (status === null) and any non-zero status as failure
-      // so the next fallback fires.
-      if (!r.error && r.status === 0) return { ok: true, method: cmd };
-      const reason = r.error?.message ?? `status=${r.status === null ? "signaled" : r.status}`;
-      errors.push(`${cmd}: ${reason}`);
-    } catch (e) {
-      errors.push(`${cmd}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  return { ok: false, method: "none", reason: errors.join("; ") };
-}
-
-// Kills any process listening on `port`. Returns a structured result so
-// the caller can distinguish between (a) port was free, (b) kill succeeded,
-// (c) kill failed (perms, missing binary, or per-pid failure mid-loop).
-//
-// On Windows the netstat parser is locale-independent: the STATE column
-// ("LISTENING" / "ESTABLISHED" / ...) is translated on non-English Windows
-// (Windows-FR shows "À l'écoute", Windows-DE "ABHÖREN", etc.), but the REMOTE
-// ADDRESS column is not. A listening TCP socket always has remote
-// "0.0.0.0:0" (IPv4) or "[::]:0" (IPv6); a connected one has a real
-// addr:port. We therefore key off the remote column instead of the state
-// string. This also rules out the pre-fix bug where matching only the local
-// port number cross-matched a remote :port from an outbound connection and
-// taskkill'd an unrelated process.
-export function killProcessOnPort(
-  port: number,
-  platform: NodeJS.Platform = process.platform,
-  runner: SpawnSyncFn = spawnSync,
-): KillResult {
-  const result: KillResult = { killedPids: [], attemptedPids: [], errors: [] };
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    result.errors.push(`invalid port: ${port}`);
-    return result;
-  }
-
-  try {
-    if (platform === "win32") {
-      const r = runner("netstat", ["-ano"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: HELPER_SPAWN_TIMEOUT_MS,
-      });
-      if (r.error) {
-        result.errors.push(`netstat: ${r.error.message}`);
-        return result;
-      }
-      if (r.status !== 0 || typeof r.stdout !== "string") return result;
-
-      const portSuffix = `:${port}`;
-      const pids = new Set<string>();
-      for (const rawLine of r.stdout.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        const tokens = line.split(/\s+/);
-        // netstat -ano LISTENING row (en-US): "TCP  0.0.0.0:4747  0.0.0.0:0  LISTENING  1234"
-        // The STATE column is locale-translated and may itself contain spaces
-        // (Windows-FR `À l'écoute` splits into two tokens), so we cannot index
-        // STATE by position. PID is always the trailing column; PROTO/LOCAL/
-        // REMOTE are the first three. We anchor on those + a remote-wildcard
-        // check that's locale-independent.
-        if (tokens.length < 5) continue;
-        const proto = tokens[0];
-        const local = tokens[1];
-        const remote = tokens[2];
-        const pid = tokens[tokens.length - 1];
-        if (proto !== "TCP") continue;
-        if (!local.endsWith(portSuffix)) continue;
-        // Listening sockets carry a wildcard remote; anything else is a
-        // connection (and matching it would kill an unrelated process).
-        if (remote !== "0.0.0.0:0" && remote !== "[::]:0") continue;
-        if (!/^\d+$/.test(pid)) continue;
-        pids.add(pid);
-      }
-      for (const pid of pids) {
-        result.attemptedPids.push(pid);
-        try {
-          const k = runner("taskkill", ["/F", "/PID", pid], {
-            stdio: "ignore",
-            timeout: HELPER_SPAWN_TIMEOUT_MS,
-          });
-          if (k.error || k.status !== 0) {
-            result.errors.push(
-              `taskkill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
-            );
-          } else {
-            result.killedPids.push(pid);
-          }
-        } catch (e) {
-          result.errors.push(`taskkill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-    } else {
-      const r = runner("lsof", ["-ti", `:${port}`], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: HELPER_SPAWN_TIMEOUT_MS,
-      });
-      if (r.error) {
-        // ENOENT (lsof not installed) is a real diagnostic; surface it.
-        result.errors.push(`lsof: ${r.error.message}`);
-        return result;
-      }
-      // lsof exits 1 with empty stdout when the port is free — not an error.
-      if (r.status !== 0 || typeof r.stdout !== "string") return result;
-
-      const pids = r.stdout.split(/\r?\n/).filter(p => /^\d+$/.test(p));
-      for (const pid of pids) {
-        result.attemptedPids.push(pid);
-        try {
-          const k = runner("kill", [pid], {
-            stdio: "ignore",
-            timeout: HELPER_SPAWN_TIMEOUT_MS,
-          });
-          if (k.error || k.status !== 0) {
-            result.errors.push(
-              `kill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
-            );
-          } else {
-            result.killedPids.push(pid);
-          }
-        } catch (e) {
-          result.errors.push(`kill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-    }
-  } catch (e) {
-    result.errors.push(e instanceof Error ? e.message : String(e));
-  }
-  return result;
-}
-
-// ── ctx-insight: open the hosted Insight dashboard ───────────────────────────
-// Insight pivoted from a locally-built dashboard to the hosted B2B product at
-// context-mode.com/insight (the landing page is the single source of truth).
-// The tool now simply opens that URL in the user default browser via the same
-// cross-platform helper (openBrowserSync) used elsewhere.
-const INSIGHT_URL = "https://context-mode.com/insight";
-
-server.registerTool(
-  "ctx_insight",
-  {
-    title: "Open Insight Dashboard",
-    // #846: opens a hosted dashboard URL in the browser — an external side
-    // effect (open world), not a read-only query; safe to repeat.
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true,
-    },
-    description:
-      "Opens the context-mode Insight dashboard (https://context-mode.com/insight) in your " +
-      "default browser — a dashboard launcher for the hosted analytics layer, not a Q&A engine. " +
-      "Insight surfaces per-engineer productive rate, retry waste, blocker detection, and " +
-      "role-narrowed views for CTO, EM, IC, CISO, FinOps, and DevOps. " +
-      "For natural-language queries over your indexed content, use ctx_search.",
-    inputSchema: z.object({}),
-  },
-  async () => {
-    const open = openBrowserSync(INSIGHT_URL);
-    const text = open.ok
-      ? `Opening Insight in your browser: ${INSIGHT_URL}`
-      : `Could not auto-open your browser (${open.reason}).\nOpen Insight manually: ${INSIGHT_URL}`;
-    return trackResponse("ctx_insight", {
-      content: [{ type: "text" as const, text }],
-    });
-  },
-);
-
+// ─────────────────────────────────────────────────────────
+// Server startup
 // ─────────────────────────────────────────────────────────
 // Server startup
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  // Clean up stale DB files from previous sessions
-  const cleaned = cleanupStaleDBs();
-  if (cleaned > 0) {
-    console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
-  }
+  cleanupStaleDBs();
 
-  // MCP readiness sentinel path (#230, #347)
-  // Uses process.pid (not ppid) — hooks use directory-scan to find any live sentinel.
-  // Hardcoded /tmp on Unix to avoid TMPDIR mismatch (#347).
-  const mcpSentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
-  const mcpSentinel = join(mcpSentinelDir, `context-mode-mcp-ready-${process.pid}`);
-  // #844: handle to the periodic sentinel refresh timer (started after connect).
-  let sentinelRefresh: ReturnType<typeof setInterval> | undefined;
-
-  // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.close(); // persist DB for --continue sessions
-    try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
-    // Remove MCP readiness sentinel (#230)
-    try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
-    // #844: stop refreshing the sentinel mtime on shutdown.
-    if (sentinelRefresh) clearInterval(sentinelRefresh);
+    if (_store) _store.close();
+    try { unlinkSync(CM_FS_PRELOAD); } catch {}
   };
-  const gracefulShutdown = async () => {
-    // Final stats flush — bypass throttle so the last 0-500ms of
-    // bytes_indexed / bytes_returned aren't silently lost on SIGTERM/SIGINT
-    // (PR #401 grill-me review B1: persistStats early-returns inside throttle
-    // window; gracefulShutdown previously did NOT bypass).
-    try {
-      _lastStatsPersist = 0;
-      persistStats();
-    } catch { /* best effort — never block shutdown */ }
+  const gracefulShutdown = () => {
     shutdown();
     process.exit(0);
   };
   process.on("exit", shutdown);
-  process.on("SIGINT", () => { gracefulShutdown(); });
-  process.on("SIGTERM", () => { gracefulShutdown(); });
-
-  // Lifecycle guard: detect parent death + stdin close to prevent orphaned processes (#103)
-  startLifecycleGuard({ onShutdown: () => gracefulShutdown() });
+  process.on("SIGINT", gracefulShutdown);
+  process.on("SIGTERM", gracefulShutdown);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // #854: refresh the bridge-child idle clock on each inbound MCP message so an
-  // abandoned bridge child (CONTEXT_MODE_BRIDGE_DEPTH>0) self-terminates instead
-  // of accumulating under a long-lived Pi/omp parent. Best-effort; no stdin touch.
-  attachMcpActivityTap(
-    transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
-  );
-
-  // Write MCP readiness sentinel (#230)
-  try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
-
-  // #844: refresh the sentinel mtime while the server is alive so readiness
-  // probes from a foreign PID namespace (shared /tmp) can trust a recent
-  // sentinel even when process.kill(pid, 0) cannot see this PID. The reader's
-  // freshness window is 90s (hooks/core/mcp-ready.mjs); refresh at 30s (3x).
-  // unref() so this timer never keeps the event loop alive on its own.
-  sentinelRefresh = setInterval(() => {
-    try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
-  }, 30_000);
-  sentinelRefresh.unref();
-
-  // Detect platform adapter — stored for platform-aware session paths
-  try {
-    const { detectPlatform, getAdapter } = await import("./adapters/detect.js");
-    const clientInfo = server.server.getClientVersion();
-    const signal = detectPlatform(clientInfo ?? undefined);
-    _detectedAdapter = await getAdapter(signal.platform);
-    if (clientInfo) {
-      console.error(`MCP client: ${clientInfo.name} v${clientInfo.version} → ${signal.platform}`);
-    }
-  } catch { /* best effort — _detectedAdapter stays null, falls back to .claude */ }
-
-  // Restore tool-call counters from SessionDB BEFORE the heartbeat fires
-  // so the very first persistStats() carries the prior PID's totals into
-  // the sidecar JSON the statusline reads. Otherwise `/ctx-upgrade` flashes
-  // `0 calls / $0.00` until the user makes another MCP tool call. Wrapped
-  // in try/catch — a stats-restore failure must never block server startup.
-  try {
-    const restored = restoreSessionStats(getSessionDbPath());
-    if (restored) {
-      for (const [tool, count] of Object.entries(restored.calls)) {
-        sessionStats.calls[tool] = count;
-      }
-      for (const [tool, bytes] of Object.entries(restored.bytesReturned)) {
-        sessionStats.bytesReturned[tool] = bytes;
-      }
-      // Anchor uptime_ms to the original session start so `/ctx-upgrade`
-      // doesn't reset the "session age" the statusline shows.
-      if (restored.sessionStart > 0) {
-        sessionStats.sessionStart = restored.sessionStart;
-      }
-    }
-  } catch { /* best effort — never block startup on a stats restore failure */ }
-
-  // Non-blocking version check — result stored for trackResponse warnings.
-  // First fetch at startup, then refresh every hour so long-running sessions
-  // (some users keep the MCP server alive 24h+) catch new releases without a
-  // restart. `.unref()` lets the process exit normally on SIGTERM regardless
-  // of pending intervals.
-  fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  setInterval(() => {
-    fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  }, 60 * 60 * 1000).unref();
-
-  // Stats heartbeat — keep the statusline truthful while the user works in
-  // tools other than MCP (Bash/Read/Edit during long sessions or post-/compact
-  // pauses). Without this, stats.updated_at only advances on MCP tool calls,
-  // so bin/statusline.mjs falsely flips to "stale — restart to resume saving"
-  // even though the server is alive. Heartbeat refreshes updated_at every 60s;
-  // statusline staleness threshold is 30min (cliff is 30 missed ticks away).
-  setInterval(() => persistStats(), 60_000).unref();
-
   if (process.stdin.isTTY) {
     console.error(`Context Mode MCP server v${VERSION} running on stdio`);
     console.error(`Detected runtimes:\n${getRuntimeSummary(runtimes)}`);
-    if (!hasBunRuntime()) {
-      console.error(
-        "\nPerformance tip: Install Bun for 3-5x faster JS/TS execution",
-      );
-      console.error("  curl -fsSL https://bun.sh/install | bash");
-    }
   }
 }
 
 // Runs after every registerTool() above, so the SDK's default tools/list handler
 // exists and can be wrapped. Makes ctx_* schemas safe for strict (Gemini
 // function-calling) clients like Antigravity CLI (`agy`) / Gemini CLI.
-installStrictClientSchemaCompat();
 
-if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error("Fatal:", err);
     process.exit(1);

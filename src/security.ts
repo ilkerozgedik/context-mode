@@ -1,7 +1,8 @@
 import { readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { relative, resolve, sep } from "node:path";
 
-import { resolveAdapterGlobalSettingsPaths } from "./util/claude-config.js";
+const defaultGlobalSettingsPath = () => resolve(homedir(), ".claude", "settings.json");
 
 // ==============================================================================
 // Types
@@ -380,10 +381,7 @@ export function readBashPolicies(
   // PLUS the claude global (defense in depth). When the caller passes an
   // explicit globalSettingsPath we honor it verbatim (back-compat with tests
   // and callers that already know which file to read).
-  const globalPaths =
-    globalSettingsPath !== undefined
-      ? [globalSettingsPath]
-      : resolveAdapterGlobalSettingsPaths();
+  const globalPaths = [globalSettingsPath ?? defaultGlobalSettingsPath()];
 
   for (const globalPath of globalPaths) {
     const globalPolicy = readSingleSettings(globalPath);
@@ -476,10 +474,7 @@ export function readToolPermissionPatterns(
   // claude global. Each settings file contributes its own globs array entry
   // so the precedence ordering downstream remains per-file rather than
   // collapsed.
-  const globalPaths =
-    globalSettingsPath !== undefined
-      ? [globalSettingsPath]
-      : resolveAdapterGlobalSettingsPaths();
+  const globalPaths = [globalSettingsPath ?? defaultGlobalSettingsPath()];
 
   for (const globalPath of globalPaths) {
     const globalGlobs = extractGlobs(globalPath);
