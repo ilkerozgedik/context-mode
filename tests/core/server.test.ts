@@ -2249,11 +2249,8 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
   });
 
   test("inline fallback copies package files to plugin root", () => {
-    // The inline script must copy the published package payload back, including
-    // newly added files such as the statusline bin directory.
-    expect(packageJson.files).toEqual(
-      expect.arrayContaining(["server.bundle.mjs", "cli.bundle.mjs", "bin"]),
-    );
+    // The 1MCP fork publishes only the stdio server runtime payload.
+    expect(packageJson.files).toEqual(["server.bundle.mjs", "README.md", "LICENSE"]);
     expect(serverSrc).toContain('readFileSync(join(T,"package.json"),"utf8")');
     expect(serverSrc).toContain("pkg.files");
     expect(serverSrc).toContain("Array.isArray(pkg.files)");
@@ -3009,22 +3006,9 @@ describe("batch_execute FS read tracking", () => {
     expect(serverSrc).toContain(".default(1)");
   });
 
-  test("tool description documents the concurrency field with positive guidance", () => {
-    // PR #683 / ADR-0002: emoji bullets replaced with prose. The standalone
-    // CONCURRENCY: section was folded into WHEN: / WHEN NOT: prose by the
-    // PR #683 WS3 canonical-structure pass so descriptions only carry the
-    // four canonical sections (WHEN / WHEN NOT / RETURNS / EXAMPLE) plus
-    // approved per-tool carve-outs (e.g. ctx_purge SCOPES / CONTRACT).
-    // The I/O-bound vs CPU-bound split and the 4-8 speedup window are still
-    // named — the PR #683 second amendment then deepened the concurrency
-    // guidance (CPU-bound stays at 1, GitHub API caps at 4 to respect rate
-    // limits, I/O-bound uses 4-8). This test pins the load-bearing concepts
-    // (I/O-bound parallelism, the 4-8 window, the keep-at-1 rule) not the
-    // exact prose so future copy-edits don't break it.
-    expect(serverSrc).toMatch(/parallelize I\/O-bound (work|calls|batches)/);
-    expect(serverSrc).toMatch(/4-8\s+(for I\/O-bound|I\/O-bound batches)/);
-    expect(serverSrc).toContain("CPU-bound or stateful");
-    expect(serverSrc).toContain("keep concurrency at 1");
+  test("concurrency schema keeps compact I/O guidance", () => {
+    expect(serverSrc).toContain("Use 4-8 for I/O-bound batches");
+    expect(serverSrc).toContain("Keep at 1 for CPU-bound");
   });
 });
 
@@ -3600,21 +3584,9 @@ describe("ctx_fetch_and_index batch refactor", () => {
     expect(block).toContain("ttlStr: formatFetchTtl(cacheTtlMs)");
   });
 
-  test("PARALLELIZE I/O guidance + locked requests:[] schema in description", () => {
-    // PR #683 / ADR-0002: emoji bullets replaced with prose. PR #683 WS3
-    // (canonical structure) folded the dedicated CONCURRENCY: section into
-    // the WHEN: / RETURNS: prose so the description carries only the
-    // canonical four sections (WHEN / WHEN NOT / RETURNS / EXAMPLE).
-    // PR #683 second amendment then deepened the concurrency guidance
-    // (gh API cap 4, single-writer mechanism explanation) and reframed the
-    // FTS5 serialization in more technical terms ("write phase always runs
-    // serially because SQLite is a single-writer store").
-    // This test pins the load-bearing concepts (requests:[] batch shape,
-    // 4-8 I/O window, FTS5 serial-write contract) using semantic regexes
-    // so future copy-edits don't break it.
-    expect(fetchHandlerSrc).toMatch(/requests(:\s*\[|`\s*array)/);
-    expect(fetchHandlerSrc).toMatch(/4-8\s+(for|stable)/);
-    expect(fetchHandlerSrc).toMatch(/FTS5[^.]*(serializes? writes?|write phase[^.]*serial|single-writer)/);
+  test("batch schema keeps requests + compact concurrency guidance", () => {
+    expect(fetchHandlerSrc).toContain("requests: z");
+    expect(fetchHandlerSrc).toContain("Use 4-8 for I/O-bound multi-URL batches");
   });
 
   test("serial-write contract: index drain is a for-loop calling indexFetched serially", () => {
@@ -5281,9 +5253,8 @@ test("registerEmptyToolsListHandler responds with {tools:[]} so operators don't 
 // Per CONTRIBUTING.md "Test file organization", we fold the contract into
 // tests/core/server.test.ts rather than creating tests/server/*.test.ts.
 //
-// Exemptions: ctx_stats, ctx_doctor, ctx_insight have minimal one-line
-// descriptions by design — they are GUI/diagnostic affordances, not routing
-// targets, so the WHEN: structural requirement does not apply.
+// 1MCP fork: all tool descriptions are intentionally concise selection cues;
+// detailed routing policy is not shipped in MCP tool metadata.
 describe("tool description style contract (#683 ADR-0002)", () => {
   const serverTsPath = resolve(__dirname, "../../src/server.ts");
   const serverTs = readFileSync(serverTsPath, "utf-8");
@@ -5337,10 +5308,17 @@ describe("tool description style contract (#683 ADR-0002)", () => {
   //   agent to run the returned shell command). Audit row: "LOW — MUST is
   //   appropriate here (post-call obligation), good use case. No change."
   const EXEMPT_FROM_WHEN = new Set([
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_index",
+    "ctx_search",
+    "ctx_fetch_and_index",
+    "ctx_batch_execute",
     "ctx_stats",
     "ctx_doctor",
-    "ctx_insight",
     "ctx_upgrade",
+    "ctx_purge",
+    "ctx_insight",
   ]);
 
   // ctx_purge carve-out — the rewrite (PR #683 WS2) preserves the
@@ -6436,9 +6414,11 @@ describe("ctx_search progressive throttle observability (issue #697)", () => {
     expect(serverSrc).toMatch(/⚠ search call #\$\{searchCallCount\}/);
   });
 
-  test("ctx_search description documents the throttle policy", () => {
-    expect(serverSrc).toMatch(/RETURNS:[\s\S]{0,2000}rolling time window/i);
-    expect(serverSrc).toMatch(/CONTEXT_MODE_SEARCH_WINDOW_MS/);
+  test("ctx_search description omits internal throttle tuning", () => {
+    const tool = REGISTERED_CTX_TOOLS.find((entry) => entry.name === "ctx_search");
+    const description = String(tool?.config.description ?? "");
+    expect(description).not.toContain("CONTEXT_MODE_SEARCH_WINDOW_MS");
+    expect(description).not.toContain("rolling time window");
   });
 });
 
@@ -6679,17 +6659,29 @@ describe("ctx_* MCP tool annotations (#846)", () => {
     ctx_search:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
     ctx_fetch_and_index: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true  },
     ctx_batch_execute:   { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
-    ctx_stats:           { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
     ctx_doctor:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-    ctx_upgrade:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
     ctx_purge:           { readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: false },
-    ctx_insight:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: true  },
   };
   const tools = REGISTERED_CTX_TOOLS as Array<{ name: string; config: { annotations?: Hints } }>;
   const find = (name: string) => tools.find((t) => t.name === name);
 
   test("registers exactly the expected ctx_* tools", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(Object.keys(EXPECTED).sort());
+  });
+
+  test("keeps exposed 1MCP tool descriptions concise", () => {
+    for (const tool of tools) {
+      const description = String(tool.config.description ?? "");
+      expect(description.length, `${tool.name} description too long`).toBeLessThanOrEqual(180);
+      expect(description, `${tool.name} description must be single-line`).not.toContain("\n");
+    }
+  });
+
+  test("ships only the stdio MCP runtime", () => {
+    const pkg = JSON.parse(readFileSync(resolve(__dirname, "../../package.json"), "utf8"));
+    expect(pkg.bin).toEqual({ "context-mode": "./server.bundle.mjs" });
+    expect(pkg.files).toEqual(["server.bundle.mjs", "README.md", "LICENSE"]);
+    expect(pkg.scripts?.postinstall).toBeUndefined();
   });
 
   test("every ctx_* tool carries explicit annotations classified by real behavior", () => {
@@ -6702,7 +6694,7 @@ describe("ctx_* MCP tool annotations (#846)", () => {
   });
 
   test("read-only diagnostic/query tools are readOnlyHint:true (the #846 cancellation fix)", () => {
-    for (const name of ["ctx_search", "ctx_stats", "ctx_doctor"]) {
+    for (const name of ["ctx_search", "ctx_doctor"]) {
       expect(find(name)!.config.annotations!.readOnlyHint).toBe(true);
     }
   });
@@ -6710,7 +6702,7 @@ describe("ctx_* MCP tool annotations (#846)", () => {
   test("never blanket-marks executing/mutating/destructive tools read-only", () => {
     for (const name of [
       "ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_index",
-      "ctx_fetch_and_index", "ctx_purge", "ctx_upgrade", "ctx_insight",
+      "ctx_fetch_and_index", "ctx_purge",
     ]) {
       expect(find(name)!.config.annotations!.readOnlyHint).toBe(false);
     }
