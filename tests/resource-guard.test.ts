@@ -72,6 +72,43 @@ describe("resource guards", () => {
     }
   });
 
+  test("serializes project-scoped calls across concurrent projects", async () => {
+    const rootA = mkdtempSync(join(tmpdir(), "context-mode-concurrent-a-"));
+    const rootB = mkdtempSync(join(tmpdir(), "context-mode-concurrent-b-"));
+    const storage = mkdtempSync(join(tmpdir(), "context-mode-concurrent-storage-"));
+    const previousStorage = process.env.CONTEXT_MODE_DIR;
+    process.env.CONTEXT_MODE_DIR = storage;
+
+    const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute");
+    const purge = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_purge");
+    expect(batch).toBeDefined();
+    expect(purge).toBeDefined();
+
+    const run = (root: string, marker: string) => withProjectDirOverride(root, () =>
+      batch!.handler({
+        commands: [{ label: marker, command: `printf ${marker}` }],
+        queries: [marker],
+        timeout: 30000,
+        concurrency: 1,
+        query_scope: "batch",
+        cwd: root,
+      }),
+    );
+
+    try {
+      const results = await Promise.all([run(rootA, "PROJECT_A_CONCURRENT"), run(rootB, "PROJECT_B_CONCURRENT")]) as Array<{ isError?: boolean }>;
+      expect(results.every((result) => result.isError !== true)).toBe(true);
+    } finally {
+      await withProjectDirOverride(rootA, () => purge!.handler({ confirm: true }));
+      await withProjectDirOverride(rootB, () => purge!.handler({ confirm: true }));
+      if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
+      else process.env.CONTEXT_MODE_DIR = previousStorage;
+      rmSync(rootA, { recursive: true, force: true });
+      rmSync(rootB, { recursive: true, force: true });
+      rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
   test("switches the active content store when the project changes", async () => {
     const rootA = mkdtempSync(join(tmpdir(), "context-mode-project-a-"));
     const rootB = mkdtempSync(join(tmpdir(), "context-mode-project-b-"));

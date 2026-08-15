@@ -82,13 +82,44 @@ export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
 
 const sdkRegisterTool = server.registerTool.bind(server);
 
+const SERIALIZED_PROJECT_TOOLS = new Set([
+  "ctx_execute",
+  "ctx_execute_file",
+  "ctx_index",
+  "ctx_search",
+  "ctx_fetch_and_index",
+  "ctx_batch_execute",
+  "ctx_purge",
+]);
+
+// ponytail: global project-tool lock; use per-project locks only if throughput matters.
+let projectToolLock: Promise<void> = Promise.resolve();
+
+async function withProjectToolLock<T>(projectDir: string, fn: () => Promise<T> | T): Promise<T> {
+  const previous = projectToolLock;
+  let release!: () => void;
+  projectToolLock = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await projectDirOverride.run({ projectDir }, fn);
+  } finally {
+    release();
+  }
+}
+
 function registerCtxTool(
   name: string,
   config: Record<string, unknown>,
   handler: (toolArgs: any) => Promise<any> | any,
 ): unknown {
-  REGISTERED_CTX_TOOLS.push({ name, config, handler });
-  return (sdkRegisterTool as any)(name, config, handler);
+  const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
+    ? (toolArgs: any) => withProjectToolLock(
+        resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
+        () => handler(toolArgs),
+      )
+    : handler;
+  REGISTERED_CTX_TOOLS.push({ name, config, handler: guardedHandler });
+  return (sdkRegisterTool as any)(name, config, guardedHandler);
 }
 
 type ToolContextOverride = { projectDir: string };
