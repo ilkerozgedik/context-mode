@@ -879,6 +879,25 @@ export class ContentStore {
   // ── Shared DB Insertion ──
 
   /**
+   * Enforce the storage invariant at the last boundary before SQLite.
+   * Chunkers optimize for structure, but a single long paragraph or a future
+   * indexing path must never create an oversized FTS row.
+   */
+  #enforceChunkByteLimit(chunks: Chunk[]): Chunk[] {
+    return chunks.flatMap((chunk) => {
+      if (Buffer.byteLength(chunk.content) <= MAX_CHUNK_BYTES) return [chunk];
+      return this.#splitOversizedPlainChunk(
+        chunk.content.split("\n"),
+        chunk.title,
+        MAX_CHUNK_BYTES,
+      ).map((part) => ({
+        ...part,
+        hasCode: chunk.hasCode || part.content.includes("```"),
+      }));
+    });
+  }
+
+  /**
    * Shared DB insertion logic for all index methods. Inserts chunks
    * into both FTS5 tables within a transaction and extracts vocabulary.
    * Uses cached prepared statements from #prepareStatements().
@@ -890,7 +909,8 @@ export class ContentStore {
     filePath?: string,
     contentHash?: string,
   ): IndexResult {
-    const codeChunks = chunks.filter((c) => c.hasCode).length;
+    const boundedChunks = this.#enforceChunkByteLimit(chunks);
+    const codeChunks = boundedChunks.filter((c) => c.hasCode).length;
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -900,16 +920,16 @@ export class ContentStore {
       this.#stmtDeleteChunksTrigramByLabel.run(label);
       this.#stmtDeleteSourcesByLabel.run(label);
 
-      if (chunks.length === 0) {
+      if (boundedChunks.length === 0) {
         const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
         return Number(info.lastInsertRowid);
       }
 
-      const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks, filePath ?? null, contentHash ?? null);
+      const info = this.#stmtInsertSource.run(label, boundedChunks.length, codeChunks, filePath ?? null, contentHash ?? null);
       const sourceId = Number(info.lastInsertRowid);
 
       const now = new Date().toISOString();
-      for (const chunk of chunks) {
+      for (const chunk of boundedChunks) {
         const ct = chunk.hasCode ? "code" : "prose";
         this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, now);
         this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, now);
@@ -933,7 +953,7 @@ export class ContentStore {
     return {
       sourceId,
       label,
-      totalChunks: chunks.length,
+      totalChunks: boundedChunks.length,
       codeChunks,
     };
   }

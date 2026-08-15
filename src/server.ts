@@ -37,6 +37,26 @@ const VERSION: string = (() => {
   return "unknown";
 })();
 
+const INDEX_OUTPUT_CAP_BYTES = 4 * 1024 * 1024;
+
+function byteCappedPrefix(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char);
+    if (bytes + charBytes > maxBytes) break;
+    bytes += charBytes;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+function capIndexableOutput(text: string): { text: string; truncated: boolean } {
+  const capped = byteCappedPrefix(text, INDEX_OUTPUT_CAP_BYTES);
+  return { text: capped, truncated: capped.length !== text.length };
+}
+
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
 });
@@ -103,6 +123,7 @@ process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best ef
 
 // Lazy singleton — no DB overhead unless index/search is used
 let _store: ContentStore | null = null;
+let _storeProjectDir: string | null = null;
 
 const DEFAULT_CONTENT_DIR = join(homedir(), ".claude", "context-mode", "content");
 
@@ -110,6 +131,11 @@ export function getProjectDir(): string {
   const override = projectDirOverride.getStore();
   if (override) return override.projectDir;
   return resolve(process.env.CONTEXT_MODE_PROJECT_DIR?.trim() || process.env.PWD || process.cwd());
+}
+
+function resolveExecutionProjectDir(cwd?: string): string {
+  if (!cwd) return getProjectDir();
+  return isAbsolute(cwd) ? resolve(cwd) : resolve(getProjectDir(), cwd);
 }
 
 function resolveProjectPath(filePath: string): string {
@@ -138,9 +164,8 @@ function projectHash(projectDir: string, canonical = true): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
-function getStorePath(): string {
+function getStorePath(projectDir: string = getProjectDir()): string {
   const dir = getContentDir();
-  const projectDir = getProjectDir();
   const canonicalPath = join(dir, `${projectHash(projectDir)}.db`);
   if (existsSync(canonicalPath)) return canonicalPath;
 
@@ -156,17 +181,23 @@ function getStorePath(): string {
   return canonicalPath;
 }
 
-function getStore(): ContentStore {
+function getStore(projectDir: string = getProjectDir()): ContentStore {
+  if (_store && _storeProjectDir !== projectDir) {
+    try { _store.close(); } catch {}
+    _store = null;
+    _storeProjectDir = null;
+  }
+
   if (!_store) {
-    const dbPath = getStorePath();
+    const dbPath = getStorePath(projectDir);
     _store = new ContentStore(dbPath);
+    _storeProjectDir = projectDir;
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
     // made after a file was originally indexed. See #442 round-3.
     _store.setDenyChecker((filePath: string) => {
       try {
-        const projectDir = getProjectDir();
         const denyGlobs = readToolDenyPatterns("Read", projectDir);
         const r = evaluateFilePath(
           filePath,
@@ -810,7 +841,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           return {
             content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
+              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
             ],
             isError,
           };
@@ -838,14 +869,14 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
         return {
           content: [
-            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
+            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
           ],
         };
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        const indexed = indexStdout(stdout, `execute:${language}`);
+        const indexed = indexStdout(stdout, `execute:${language}`, resolveExecutionProjectDir(cwd));
         // Prepend echo to the first text content so provenance still surfaces
         const echoed = {
           ...indexed,
@@ -882,14 +913,16 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 function indexStdout(
   stdout: string,
   source: string,
+  projectDir: string = getProjectDir(),
 ): { content: Array<{ type: "text"; text: string }> } {
-  const store = getStore();
-  const indexed = store.index({ content: stdout, source });
+  const indexable = capIndexableOutput(stdout);
+  const store = getStore(projectDir);
+  const indexed = store.index({ content: indexable.text, source });
   return {
     content: [
       {
         type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
+        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}${indexable.truncated ? `\nOutput capped at ${(INDEX_OUTPUT_CAP_BYTES / 1024 / 1024).toFixed(0)}MB before indexing.` : ""}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
       },
     ],
   };
@@ -907,13 +940,15 @@ function intentSearch(
   intent: string,
   source: string,
   maxResults: number = 5,
+  projectDir: string = getProjectDir(),
 ): string {
+  const indexable = capIndexableOutput(stdout);
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
   // Index into the PERSISTENT store so user can ctx_search() later
-  const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source, undefined);
+  const persistent = getStore(projectDir);
+  const indexed = persistent.indexPlainText(indexable.text, source, undefined);
 
   // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
@@ -2281,6 +2316,8 @@ registerCtxTool(
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);
       const totalLines = stdout.split("\n").length;
+      const indexable = capIndexableOutput(stdout);
+      const projectDir = resolveExecutionProjectDir(cwd);
 
       if (timedOut && perCommandOutputs.length === 0) {
         return {
@@ -2297,12 +2334,12 @@ registerCtxTool(
       // Track indexed bytes (raw data that stays in the persistent store)
 
       // Index into knowledge base — markdown heading chunking splits by # labels
-      const store = getStore();
+      const store = getStore(projectDir);
       const source = `batch:${commands
         .map((c: { label: string; command: string }) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source });
+      const indexed = store.index({ content: indexable.text, source });
 
       // Commands inventory — list what the agent actually ran so the
       // response itself documents intent, not just per-section echoes.
@@ -2336,7 +2373,7 @@ registerCtxTool(
 
       const output = [
         `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
-          `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
+          `Indexed ${indexed.totalChunks} sections${indexable.truncated ? ` (output capped at ${(INDEX_OUTPUT_CAP_BYTES / 1024 / 1024).toFixed(0)}MB before indexing)` : ""}. Searched ${queries.length} queries.`,
         "",
         ...commandsInventory,
         "",
@@ -2448,6 +2485,7 @@ registerCtxTool(
     if (_store) {
       try { _store.close(); } catch {}
       _store = null;
+      _storeProjectDir = null;
     }
 
     try {

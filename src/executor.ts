@@ -230,7 +230,7 @@ export class PolyglotExecutor {
     projectRoot?: string | (() => string);
     runtimes?: RuntimeMap;
   }) {
-    this.#hardCapBytes = opts?.hardCapBytes ?? 100 * 1024 * 1024; // 100MB
+    this.#hardCapBytes = opts?.hardCapBytes ?? 8 * 1024 * 1024; // 8MB
     const pr = opts?.projectRoot;
     if (typeof pr === "function") {
       this.#projectRootResolver = pr;
