@@ -149,6 +149,8 @@ function maxEditDistance(wordLength: number): number {
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
 const MAX_CHUNK_BYTES = 4096;
+const MAX_INDEX_INPUT_BYTES = 8 * 1024 * 1024;
+const MAX_VOCABULARY_BYTES = 1024 * 1024;
 
 // Blank-line sectioning is used only for output that is *naturally* sectioned:
 // at least a few sections, not an unbounded explosion, and no single section so
@@ -726,9 +728,13 @@ export class ContentStore {
     // captured at gate-time. fstat also rejects non-regular files
     // (directories, character devices) which would otherwise read as ""
     // or throw inconsistently. See #442 round-3.
+    const label = source ?? path ?? "untitled";
     let text: string;
     if (hasContent) {
       text = content!;
+      if (Buffer.byteLength(text) > MAX_INDEX_INPUT_BYTES) {
+        throw new Error(`input too large for ${label}: exceeds 8MB safety limit`);
+      }
     } else {
       const fd = openSync(path!, "r");
       try {
@@ -736,12 +742,17 @@ export class ContentStore {
         if (!st.isFile()) {
           throw new Error(`refusing to index ${path}: not a regular file`);
         }
+        if (st.size > MAX_INDEX_INPUT_BYTES) {
+          throw new Error(`input too large for ${label}: exceeds 8MB safety limit`);
+        }
         text = readFileSync(fd, "utf-8");
+        if (Buffer.byteLength(text) > MAX_INDEX_INPUT_BYTES) {
+          throw new Error(`input too large for ${label}: exceeds 8MB safety limit`);
+        }
       } finally {
         closeSync(fd);
       }
     }
-    const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
     // Stale detection: store file_path + SHA-256 for file-backed sources
@@ -939,7 +950,7 @@ export class ContentStore {
     });
 
     const sourceId = transaction();
-    if (text) this.#extractAndStoreVocabulary(text);
+    if (text) this.#extractAndStoreVocabulary(this.#byteCappedPrefix(text, MAX_VOCABULARY_BYTES));
 
     // Periodically optimize FTS5 indexes to merge b-tree segments.
     // Fragmentation accumulates over insert/delete cycles (dedup re-indexes
@@ -1277,6 +1288,7 @@ export class ContentStore {
         try {
           const st = fstatSync(fd);
           if (!st.isFile()) continue; // skip non-regular targets
+          if (st.size > MAX_INDEX_INPUT_BYTES) continue; // keep cached result; never read oversized refreshes
           newContent = readFileSync(fd, "utf-8");
         } finally {
           closeSync(fd);

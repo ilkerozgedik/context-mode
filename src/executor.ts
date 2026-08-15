@@ -382,7 +382,10 @@ export class PolyglotExecutor {
             proc.stderr.on("data", () => {});
           }
           const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
-          const rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
+          let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
+          if (capExceeded) {
+            rawStderr += `\n[output capped at ${(this.#hardCapBytes / 1024 / 1024).toFixed(0)}MB — excess output discarded]`;
+          }
           res({
             stdout: rawStdout,
             stderr: rawStderr,
@@ -395,34 +398,25 @@ export class PolyglotExecutor {
         }
       }, timeout);
 
-      // Stream-level byte cap: kill the process once combined stdout+stderr
-      // exceeds hardCapBytes. Without this, a command like `yes` or
-      // `cat /dev/urandom | base64` can accumulate gigabytes in memory
-      // before the timeout fires.
+      // Stream-level capture cap: retain at most hardCapBytes across stdout+stderr
+      // while continuing to drain excess output so verbose commands can finish.
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
-      let totalBytes = 0;
+      let capturedBytes = 0;
       let capExceeded = false;
 
-      proc.stdout!.on("data", (chunk: Buffer) => {
-        totalBytes += chunk.length;
-        if (totalBytes <= this.#hardCapBytes) {
-          stdoutChunks.push(chunk);
-        } else if (!capExceeded) {
-          capExceeded = true;
-          killTree(proc);
+      const capture = (chunks: Buffer[], chunk: Buffer) => {
+        const remaining = this.#hardCapBytes - capturedBytes;
+        if (remaining > 0) {
+          const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
+          chunks.push(kept);
+          capturedBytes += kept.length;
         }
-      });
+        if (chunk.length > remaining) capExceeded = true;
+      };
 
-      proc.stderr!.on("data", (chunk: Buffer) => {
-        totalBytes += chunk.length;
-        if (totalBytes <= this.#hardCapBytes) {
-          stderrChunks.push(chunk);
-        } else if (!capExceeded) {
-          capExceeded = true;
-          killTree(proc);
-        }
-      });
+      proc.stdout!.on("data", (chunk: Buffer) => capture(stdoutChunks, chunk));
+      proc.stderr!.on("data", (chunk: Buffer) => capture(stderrChunks, chunk));
 
       proc.on("close", (exitCode) => {
         clearTimeout(timer);
@@ -431,7 +425,7 @@ export class PolyglotExecutor {
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
 
         if (capExceeded) {
-          rawStderr += `\n[output capped at ${(this.#hardCapBytes / 1024 / 1024).toFixed(0)}MB — process killed]`;
+          rawStderr += `\n[output capped at ${(this.#hardCapBytes / 1024 / 1024).toFixed(0)}MB — excess output discarded]`;
         }
 
         const stdout = rawStdout;

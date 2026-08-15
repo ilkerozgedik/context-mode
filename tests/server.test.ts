@@ -29,13 +29,18 @@ describe("1MCP tool surface", () => {
     expect(schema.safeParse({ language: "ruby", code: "" }).success).toBe(false);
   });
 
-  test("ctx_index requires exactly one of content or path", () => {
+  test("ctx_index requires exactly one of content or path", async () => {
     const index = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_index");
-    const schema = index?.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(index).toBeDefined();
+    const schema = index!.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
     expect(schema.safeParse({ content: "inline" }).success).toBe(true);
     expect(schema.safeParse({ path: "README.md" }).success).toBe(true);
-    expect(schema.safeParse({}).success).toBe(false);
-    expect(schema.safeParse({ content: "inline", path: "README.md" }).success).toBe(false);
+
+    for (const args of [{}, { content: "inline", path: "README.md" }]) {
+      const result = await index!.handler(args) as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain("Provide exactly one of content or path");
+    }
   });
 
   test("ctx_index blocks paths outside the configured project root", async () => {

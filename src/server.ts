@@ -1044,6 +1044,7 @@ registerCtxTool(
     },
     description: "Analyze a selected project file without loading it into context. Code receives FILE_CONTENT and runs with the MCP server OS permissions; only printed output is returned.",
     inputSchema: z.object({
+      cwd: z.string().optional().describe("Project directory used to scope paths and the persistent index."),
       path: z
         .string()
         .describe("Absolute file path or relative to project root"),
@@ -1185,6 +1186,7 @@ registerCtxTool(
     },
     description: "Index text, files, or directories into the persistent knowledge base for later ctx_search retrieval.",
     inputSchema: z.object({
+      cwd: z.string().optional().describe("Project directory used to scope paths and the persistent index."),
       content: z
         .string()
         .min(1)
@@ -1224,10 +1226,7 @@ registerCtxTool(
       followSymlinks: z.boolean().optional().describe(
         "Directory-only: follow directory symlinks (default: false — cycle hazard + escape risk).",
       ),
-    }).refine(
-      (value) => (value.content === undefined) !== (value.path === undefined),
-      { message: "Provide exactly one of content or path." },
-    ),
+    }),
   },
   async ({ content, path, source, include, exclude, maxDepth, maxFiles, extensions, respectGitignore, followSymlinks }) => {
     if ((content === undefined) === (path === undefined)) {
@@ -1394,6 +1393,7 @@ registerCtxTool(
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: "Search indexed content. Batch related questions in queries; use source to narrow retrieval.",
     inputSchema: z.object({
+      cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
       queries: z.array(z.string()).min(1).describe("Array of search queries. Batch ALL questions in one call."),
       limit: z.coerce.number().optional().default(3).describe("Results per query (default: 3)"),
       source: z.string().optional().describe("Filter to a specific indexed source (partial match)."),
@@ -2074,6 +2074,7 @@ registerCtxTool(
     },
     description: "Fetch and index URL content server-side so raw pages stay out of context. Use ctx_search for follow-up retrieval.",
     inputSchema: z.object({
+      cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
       url: z.string().optional().describe("Single URL to fetch and index"),
       source: z
         .string()
@@ -2505,6 +2506,7 @@ registerCtxTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description: "Permanently delete indexed content for the current project. Requires confirm:true.",
     inputSchema: z.object({
+      cwd: z.string().optional().describe("Project directory whose knowledge base should be purged."),
       confirm: z.boolean().describe("MUST be true. Destructive operation; false returns 'purge cancelled'."),
     }),
   },
