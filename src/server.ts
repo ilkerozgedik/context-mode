@@ -2824,7 +2824,16 @@ async function main() {
   console.error(`Context Mode MCP server v${VERSION} listening on http://${args.host}:${args.port}/mcp`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+export function isDirectExecution(argvPath: string | undefined, moduleUrl: string): boolean {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(argvPath) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return pathToFileURL(resolve(argvPath)).href === moduleUrl;
+  }
+}
+
+if (isDirectExecution(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     console.error("Fatal:", err);
     cleanupRuntime();

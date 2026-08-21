@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTERED_CTX_TOOLS, withProjectDirOverride } from "../src/server.js";
+import { pathToFileURL } from "node:url";
+import { REGISTERED_CTX_TOOLS, isDirectExecution, withProjectDirOverride } from "../src/server.js";
 
 const EXPECTED_TOOLS = [
   "ctx_execute",
@@ -14,6 +15,22 @@ const EXPECTED_TOOLS = [
   "ctx_doctor",
   "ctx_purge",
 ];
+
+describe("context-mode startup", () => {
+  test("recognizes execution through a package-manager symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-main-"));
+    try {
+      const target = join(root, "server.bundle.mjs");
+      const link = join(root, "node_modules", "context-mode", "server.bundle.mjs");
+      mkdirSync(join(root, "node_modules", "context-mode"), { recursive: true });
+      writeFileSync(target, "// target");
+      symlinkSync(target, link);
+      expect(isDirectExecution(link, pathToFileURL(target).href)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("context-mode tool surface", () => {
   test("exposes exactly the supported tools", () => {
