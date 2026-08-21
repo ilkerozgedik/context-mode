@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, renameSync, unlinkSync } from "node:fs";
 
 export interface PreparedStatement {
   run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
@@ -16,6 +16,7 @@ export function loadDatabase(): typeof Database {
 export function applyWALPragmas(db: DatabaseInstance): void {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
+  db.pragma("busy_timeout = 5000");
   try { db.pragma("mmap_size = 268435456"); } catch {}
 }
 
@@ -24,6 +25,15 @@ export function cleanOrphanedWALFiles(dbPath: string): void {
   for (const suffix of ["-wal", "-shm"]) {
     try { unlinkSync(dbPath + suffix); } catch {}
   }
+}
+
+export function quarantineDBFiles(dbPath: string): string {
+  const quarantineBase = `${dbPath}.corrupt-${Date.now()}`;
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const source = dbPath + suffix;
+    if (existsSync(source)) renameSync(source, quarantineBase + suffix);
+  }
+  return quarantineBase;
 }
 
 export function deleteDBFiles(dbPath: string): void {
@@ -47,8 +57,7 @@ export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): 
       if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
       lastError = err instanceof Error ? err : new Error(msg);
       if (attempt < delays.length) {
-        const start = Date.now();
-        while (Date.now() - start < delays[attempt]) {}
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
       }
     }
   }

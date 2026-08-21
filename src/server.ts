@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createMcpHandler, McpServer, type McpHttpHandler } from "@modelcontextprotocol/server";
+import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
+import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from "@modelcontextprotocol/node";
+import { createServer, type IncomingMessage, type Server as NodeHttpServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, mkdirSync, renameSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
@@ -70,17 +72,13 @@ process.on("uncaughtException", (err) => {
 
 const runtimes = detectRuntimes();
 const available = getAvailableLanguages(runtimes);
-export const server = new McpServer({ name: "context-mode", version: VERSION });
-
 export interface RegisteredCtxTool {
   name: string;
   config: Record<string, unknown>;
-  handler: (args: Record<string, unknown>) => Promise<unknown> | unknown;
+  handler: (args: Record<string, unknown>, ctx?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
 }
 
 export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
-
-const sdkRegisterTool = server.registerTool.bind(server);
 
 const SERIALIZED_PROJECT_TOOLS = new Set([
   "ctx_execute",
@@ -110,16 +108,16 @@ async function withProjectToolLock<T>(projectDir: string, fn: () => Promise<T> |
 function registerCtxTool(
   name: string,
   config: Record<string, unknown>,
-  handler: (toolArgs: any) => Promise<any> | any,
+  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
 ): unknown {
   const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
-    ? (toolArgs: any) => withProjectToolLock(
+    ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => withProjectToolLock(
         resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
-        () => handler(toolArgs),
+        () => handler(toolArgs, ctx),
       )
     : handler;
   REGISTERED_CTX_TOOLS.push({ name, config, handler: guardedHandler });
-  return (sdkRegisterTool as any)(name, config, guardedHandler);
+  return guardedHandler;
 }
 
 type ToolContextOverride = { projectDir: string };
@@ -515,10 +513,11 @@ export interface BatchRunOptions {
   nodeOptsPrefix: string;
   cwd?: string;
   onFsBytes?: (bytes: number) => void;
+  signal?: AbortSignal;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string; signal?: AbortSignal }): Promise<{ stdout: string; timedOut?: boolean }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -619,7 +618,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes } = opts;
+  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes, signal } = opts;
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -646,6 +645,7 @@ export async function runBatchCommands(
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
         cwd,
+        signal,
       });
       outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
       if (result.timedOut) {
@@ -669,6 +669,7 @@ export async function runBatchCommands(
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
         cwd,
+        signal,
       });
       // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
@@ -741,7 +742,7 @@ registerCtxTool(
         .describe("Terms to match when large output is indexed."),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent }, ctx) => {
     try {
       // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
@@ -810,7 +811,7 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: timeout, background, cwd });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout: timeout, background, cwd, signal: ctx?.signal });
 
       // Echo the executed source code before stdout so users can audit
       // and host approval UIs can audit the exact payload (Issues #717 + #736).
@@ -1064,7 +1065,7 @@ registerCtxTool(
         .describe("Terms to match when large output is indexed."),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, language, code, timeout, intent }, ctx) => {
     // Constrain the selected input path before applying optional Read deny rules.
     // The supplied code itself still runs with the MCP server OS permissions.
     const boundaryDenied = checkProjectBoundary(path, "ctx_execute_file");
@@ -2325,7 +2326,7 @@ registerCtxTool(
         .describe("'batch' searches this call; 'global' searches the full index."),
     }),
   },
-  async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
+  async ({ commands, queries, timeout, concurrency, cwd, query_scope }, ctx) => {
     try {
       // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
       // The executor denies NODE_OPTIONS in its env (security), so we set it
@@ -2341,6 +2342,7 @@ registerCtxTool(
           concurrency,
           nodeOptsPrefix,
           cwd,
+          signal: ctx?.signal,
         },
         executor,
       );
@@ -2546,39 +2548,286 @@ registerCtxTool(
 // ─────────────────────────────────────────────────────────
 // Server startup
 // ─────────────────────────────────────────────────────────
-// Server startup
+// Server construction and startup
 // ─────────────────────────────────────────────────────────
 
-async function main() {
-  const shutdown = () => {
-    executor.cleanupBackgrounded();
-    if (_store) _store.close();
-    try { unlinkSync(CM_FS_PRELOAD); } catch {}
-  };
-  const gracefulShutdown = () => {
-    shutdown();
-    process.exit(0);
-  };
-  process.on("exit", shutdown);
-  process.on("SIGINT", gracefulShutdown);
-  process.on("SIGTERM", gracefulShutdown);
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  if (process.stdin.isTTY) {
-    console.error(`Context Mode MCP server v${VERSION} running on stdio`);
-    console.error(`Detected runtimes:\n${getRuntimeSummary(runtimes)}`);
+export function createContextModeServer(): McpServer {
+  const instance = new McpServer(
+    { name: "context-mode", version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+  for (const tool of REGISTERED_CTX_TOOLS) {
+    (instance.registerTool as any)(tool.name, tool.config, tool.handler);
   }
+  return instance;
 }
 
-// Runs after every registerTool() above, so the SDK's default tools/list handler
-// exists and can be wrapped. Keeps ctx_* schemas compatible with strict
-// function-calling clients.
+const MODERN_PROTOCOL_VERSION = "2026-07-28";
+const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
+
+function headerMismatchResponse(id: string | number | null, message: string): Response {
+  return Response.json({
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32020, message },
+  }, { status: 400 });
+}
+
+async function validateModernStandardHeaders(request: Request, parsedBody?: unknown): Promise<Response | null> {
+  if (request.method !== "POST") return null;
+  let body = parsedBody;
+  if (body === undefined) {
+    try { body = await request.clone().json(); } catch { return null; }
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+  const message = body as Record<string, unknown>;
+  const method = typeof message.method === "string" ? message.method : undefined;
+  const params = message.params && typeof message.params === "object" && !Array.isArray(message.params)
+    ? message.params as Record<string, unknown>
+    : undefined;
+  const meta = params?._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+    ? params._meta as Record<string, unknown>
+    : undefined;
+  if (meta?.[PROTOCOL_VERSION_META_KEY] !== MODERN_PROTOCOL_VERSION) return null;
+
+  const id = typeof message.id === "string" || typeof message.id === "number" ? message.id : null;
+  const protocolHeader = request.headers.get("mcp-protocol-version");
+  if (protocolHeader !== MODERN_PROTOCOL_VERSION) {
+    return headerMismatchResponse(id, `MCP-Protocol-Version must be ${MODERN_PROTOCOL_VERSION}`);
+  }
+  const methodHeader = request.headers.get("mcp-method");
+  if (!method || methodHeader !== method) {
+    return headerMismatchResponse(id, "Mcp-Method must match the JSON-RPC method");
+  }
+  const name = typeof params?.name === "string" ? params.name : undefined;
+  if (name !== undefined && request.headers.get("mcp-name") !== name) {
+    return headerMismatchResponse(id, "Mcp-Name must match params.name");
+  }
+  return null;
+}
+
+export function createContextModeHttpHandler(): McpHttpHandler {
+  const inner = createMcpHandler(() => createContextModeServer(), {
+    legacy: "stateless",
+    onerror: (error) => process.stderr.write(`[context-mode] MCP HTTP error: ${error.message}\n`),
+  });
+  return {
+    fetch: async (request, options) => {
+      const rejection = await validateModernStandardHeaders(request, options?.parsedBody);
+      return rejection ?? inner.fetch(request, options);
+    },
+    close: () => inner.close(),
+    notify: inner.notify,
+    bus: inner.bus,
+  };
+}
+
+const MAX_MCP_REQUEST_BYTES = 16 * 1024 * 1024;
+const SHUTDOWN_GRACE_MS = 10_000;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+
+class RequestBodyTooLargeError extends Error {}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (Number.isFinite(declared) && declared > MAX_MCP_REQUEST_BYTES) {
+    throw new RequestBodyTooLargeError(`MCP request body exceeds ${MAX_MCP_REQUEST_BYTES} bytes`);
+  }
+  let total = 0;
+  const chunks: Buffer[] = [];
+  for await (const raw of req) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    total += chunk.byteLength;
+    if (total > MAX_MCP_REQUEST_BYTES) {
+      throw new RequestBodyTooLargeError(`MCP request body exceeds ${MAX_MCP_REQUEST_BYTES} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  if (chunks.length === 0) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function writeJsonRpcHttpError(res: ServerResponse, status: number, code: number, message: string): Promise<void> {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: null, error: { code, message } });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": String(Buffer.byteLength(body)),
+  });
+  res.end(body);
+}
+
+function cleanupRuntime(): void {
+  executor.cleanupBackgrounded();
+  if (_store) {
+    try { _store.close(); } catch {}
+    _store = null;
+    _storeProjectDir = null;
+  }
+  try { unlinkSync(CM_FS_PRELOAD); } catch {}
+}
+
+export function createContextModeNodeHttpServer(
+  handler: McpHttpHandler = createContextModeHttpHandler(),
+): NodeHttpServer {
+  const validateHost = localhostHostValidation();
+  const validateOrigin = localhostOriginValidation();
+  const nodeHandler = toNodeHandler(handler, {
+    onerror: (error) => process.stderr.write(`[context-mode] Node HTTP adapter error: ${error.message}\n`),
+  });
+
+  return createServer(async (req, res) => {
+    if (!validateHost(req, res)) return;
+    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+
+    if (path === "/healthz") {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { Allow: "GET, HEAD" });
+        res.end();
+        return;
+      }
+      const body = JSON.stringify({ status: "ok", version: VERSION });
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": String(Buffer.byteLength(body)),
+      });
+      res.end(req.method === "HEAD" ? undefined : body);
+      return;
+    }
+
+    if (path !== "/mcp") {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Not Found");
+      return;
+    }
+    if (!validateOrigin(req, res)) return;
+
+    try {
+      if (req.method === "POST") {
+        const mediaType = String(req.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase();
+        if (mediaType !== "application/json") {
+          await writeJsonRpcHttpError(res, 415, -32600, "Content-Type must be application/json");
+          return;
+        }
+        const body = await readJsonBody(req);
+        await nodeHandler(req, res, body);
+        return;
+      }
+      await nodeHandler(req, res);
+    } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        await writeJsonRpcHttpError(res, 413, -32600, error.message);
+        return;
+      }
+      if (error instanceof SyntaxError) {
+        await writeJsonRpcHttpError(res, 400, -32700, "Parse error");
+        return;
+      }
+      process.stderr.write(`[context-mode] HTTP request failure: ${error instanceof Error ? error.message : String(error)}\n`);
+      await writeJsonRpcHttpError(res, 500, -32603, "Internal server error");
+    }
+  });
+}
+
+type ServerArgs = { transport: "stdio" | "http"; host: string; port: number };
+
+function parseServerArgs(argv: string[]): ServerArgs {
+  const result: ServerArgs = { transport: "stdio", host: "127.0.0.1", port: 3050 };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const value = argv[i + 1];
+    if (arg === "--transport") {
+      if (value !== "stdio" && value !== "http") throw new Error("--transport must be stdio or http");
+      result.transport = value;
+      i++;
+    } else if (arg === "--host") {
+      if (!value) throw new Error("--host requires a value");
+      result.host = value;
+      i++;
+    } else if (arg === "--port") {
+      const port = Number(value);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("--port must be 1..65535");
+      result.port = port;
+      i++;
+    } else {
+      throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+  if (result.transport === "http" && !LOOPBACK_HOSTS.has(result.host)) {
+    throw new Error("HTTP transport must bind to a loopback host");
+  }
+  return result;
+}
+
+async function closeHttpServer(server: NodeHttpServer, handler: McpHttpHandler): Promise<void> {
+  await handler.close().catch(() => {});
+  await new Promise<void>((resolveClose) => {
+    const timer = setTimeout(() => {
+      server.closeAllConnections();
+      resolveClose();
+    }, SHUTDOWN_GRACE_MS);
+    timer.unref();
+    server.close(() => {
+      clearTimeout(timer);
+      resolveClose();
+    });
+    server.closeIdleConnections();
+  });
+}
+
+async function main() {
+  const args = parseServerArgs(process.argv.slice(2));
+  let closing = false;
+  let stdioHandle: StdioServerHandle | undefined;
+  let httpServer: NodeHttpServer | undefined;
+  let httpHandler: McpHttpHandler | undefined;
+
+  const gracefulShutdown = async () => {
+    if (closing) return;
+    closing = true;
+    try {
+      if (httpServer && httpHandler) await closeHttpServer(httpServer, httpHandler);
+      if (stdioHandle) await stdioHandle.close();
+    } finally {
+      cleanupRuntime();
+    }
+  };
+
+  process.once("SIGINT", () => { void gracefulShutdown().then(() => process.exit(0)); });
+  process.once("SIGTERM", () => { void gracefulShutdown().then(() => process.exit(0)); });
+  process.once("exit", cleanupRuntime);
+
+  if (args.transport === "stdio") {
+    stdioHandle = serveStdio(() => createContextModeServer(), {
+      legacy: "serve",
+      onerror: (error) => process.stderr.write(`[context-mode] stdio error: ${error.message}\n`),
+    });
+    if (process.stdin.isTTY) {
+      console.error(`Context Mode MCP server v${VERSION} running on stdio`);
+      console.error(`Detected runtimes:\n${getRuntimeSummary(runtimes)}`);
+    }
+    return;
+  }
+
+  httpHandler = createContextModeHttpHandler();
+  httpServer = createContextModeNodeHttpServer(httpHandler);
+  httpServer.requestTimeout = 60_000;
+  httpServer.headersTimeout = 30_000;
+  await new Promise<void>((resolveListen, rejectListen) => {
+    httpServer!.once("error", rejectListen);
+    httpServer!.listen(args.port, args.host, () => {
+      httpServer!.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  console.error(`Context Mode MCP server v${VERSION} listening on http://${args.host}:${args.port}/mcp`);
+}
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error("Fatal:", err);
+    cleanupRuntime();
     process.exit(1);
   });
 }

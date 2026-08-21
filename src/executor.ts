@@ -204,6 +204,8 @@ interface ExecuteOptions {
    * a non-project cwd (e.g. $HOME).
    */
   cwd?: string;
+  /** Cancel the running process tree when the MCP request is aborted. */
+  signal?: AbortSignal;
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -262,7 +264,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false, cwd: cwdOverride } = opts;
+    const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -281,7 +283,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -296,14 +298,14 @@ export class PolyglotExecutor {
   }
 
   async executeFile(opts: ExecuteFileOptions): Promise<ExecResult> {
-    const { path: filePath, language, code, timeout } = opts;
+    const { path: filePath, language, code, timeout, signal } = opts;
     const absolutePath = resolve(this.#projectRoot, filePath);
     const wrappedCode = this.#wrapWithFileContent(
       absolutePath,
       language,
       code,
     );
-    return this.execute({ language, code: wrappedCode, timeout });
+    return this.execute({ language, code: wrappedCode, timeout, signal });
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
@@ -338,6 +340,7 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     background = false,
+    signal?: AbortSignal,
   ): Promise<ExecResult> {
     return new Promise((res) => {
       const spawnCmd = cmd[0];
@@ -355,6 +358,12 @@ export class PolyglotExecutor {
 
       let timedOut = false;
       let resolved = false;
+      const abortExecution = () => {
+        if (resolved) return;
+        killTree(proc);
+      };
+      if (signal?.aborted) abortExecution();
+      else signal?.addEventListener("abort", abortExecution, { once: true });
       // Issue #406 — if the caller didn't pass a timeout we don't fire one.
       // Timeout policy belongs to the MCP host/client (Claude Code, VSCode,
       // JetBrains all enforce their own RPC timeouts); imposing a second
@@ -419,6 +428,7 @@ export class PolyglotExecutor {
       proc.stderr!.on("data", (chunk: Buffer) => capture(stderrChunks, chunk));
 
       proc.on("close", (exitCode) => {
+        signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
         if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");

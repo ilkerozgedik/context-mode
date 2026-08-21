@@ -15,7 +15,7 @@ const EXPECTED_TOOLS = [
   "ctx_purge",
 ];
 
-describe("1MCP tool surface", () => {
+describe("context-mode tool surface", () => {
   test("exposes exactly the supported tools", () => {
     expect(REGISTERED_CTX_TOOLS.map((tool) => tool.name)).toEqual(EXPECTED_TOOLS);
   });

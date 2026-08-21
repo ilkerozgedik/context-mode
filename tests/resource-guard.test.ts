@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PolyglotExecutor } from "../src/executor.js";
@@ -7,6 +7,26 @@ import { REGISTERED_CTX_TOOLS } from "../src/server.js";
 import { ContentStore } from "../src/store.js";
 
 describe("resource guards", () => {
+  test("cancels the spawned process tree when the request aborts", async () => {
+    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const marker = join(tmpdir(), `context-mode-abort-${process.pid}-${Date.now()}`);
+    const controller = new AbortController();
+    try {
+      const run = executor.execute({
+        language: "javascript",
+        code: `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 250); setTimeout(() => {}, 1000);`,
+        timeout: 5000,
+        signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(), 30);
+      await run;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(marker, { force: true });
+      executor.cleanupBackgrounded();
+    }
+  });
   test("caps captured child output without killing the process", async () => {
     const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
     const marker = join(tmpdir(), `context-mode-output-cap-${process.pid}-${Date.now()}`);
@@ -23,6 +43,22 @@ describe("resource guards", () => {
       expect(existsSync(marker)).toBe(true);
     } finally {
       rmSync(marker, { force: true });
+    }
+  });
+
+  test("quarantines a corrupt persistent database before recovering", () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-corrupt-"));
+    const dbPath = join(root, "content.db");
+    writeFileSync(dbPath, "definitely not sqlite");
+    let store: ContentStore | undefined;
+    try {
+      store = new ContentStore(dbPath);
+      store.index({ content: "database recovered", source: "recovery" });
+      expect(store.searchWithFallback("recovered", 1, "recovery").length).toBeGreaterThan(0);
+      expect(readdirSync(root).some((name) => name.startsWith("content.db.corrupt-"))).toBe(true);
+    } finally {
+      store?.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

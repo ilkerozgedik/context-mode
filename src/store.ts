@@ -9,7 +9,7 @@
  */
 
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
+import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, quarantineDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
 import { readFileSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -336,14 +336,14 @@ export class ContentStore {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
-        deleteDBFiles(this.#dbPath);
+        const quarantinePath = quarantineDBFiles(this.#dbPath);
         cleanOrphanedWALFiles(this.#dbPath);
         try {
           db = new Database(this.#dbPath, { timeout: 30000 });
           applyWALPragmas(db);
         } catch (retryErr) {
           throw new Error(
-            `Failed to create fresh DB after deleting corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+            `Failed to create fresh DB after quarantining corrupt file at ${quarantinePath}: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
           );
         }
       } else {
