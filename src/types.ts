@@ -3,6 +3,7 @@ export interface ExecResult {
   stderr: string;
   exitCode: number;
   timedOut: boolean;
+  timeoutMs?: number;
   backgrounded?: boolean;
 }
 

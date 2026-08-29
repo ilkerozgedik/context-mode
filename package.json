@@ -1,6 +1,6 @@
 {
   "name": "context-mode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "description": "Standalone context-mode MCP server with stdio and Streamable HTTP transports.",
   "author": "Mert Koseoğlu",

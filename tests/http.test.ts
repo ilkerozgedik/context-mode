@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   createContextModeHttpHandler,
+  createContextModeNodeHttpServer,
   createContextModeServer,
 } from "../src/server.js";
 
@@ -103,6 +104,24 @@ describe("standalone MCP HTTP server", () => {
       "ctx_doctor",
       "ctx_purge",
     ]);
+  });
+
+  test("separates readiness from MCP and liveness routes", async () => {
+    const server = createContextModeNodeHttpServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("missing test server address");
+      const response = await fetch(`http://127.0.0.1:${address.port}/readyz`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ status: "ready" });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
 });

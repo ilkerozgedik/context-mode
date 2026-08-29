@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
-import { PolyglotExecutor } from "./executor.js";
+import { PolyglotExecutor, configuredExecutionAdmissionError } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
 import { ContentStore, type IndexResult } from "./store.js";
 import {
@@ -93,15 +93,37 @@ const SERIALIZED_PROJECT_TOOLS = new Set([
 // ponytail: global project-tool lock; use per-project locks only if throughput matters.
 let projectToolLock: Promise<void> = Promise.resolve();
 
-async function withProjectToolLock<T>(projectDir: string, fn: () => Promise<T> | T): Promise<T> {
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Request cancelled");
+}
+
+async function withProjectToolLock<T>(
+  projectDir: string,
+  signal: AbortSignal | undefined,
+  fn: () => Promise<T> | T,
+): Promise<T> {
   const previous = projectToolLock;
   let release!: () => void;
   projectToolLock = new Promise<void>((resolve) => { release = resolve; });
-  await previous;
+  const run = (async () => {
+    await previous;
+    try {
+      if (signal?.aborted) throw abortReason(signal);
+      return await projectDirOverride.run({ projectDir }, fn);
+    } finally {
+      release();
+    }
+  })();
+  if (!signal) return run;
+  let rejectAbort!: (reason: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(abortReason(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
   try {
-    return await projectDirOverride.run({ projectDir }, fn);
+    return await Promise.race([run, aborted]);
   } finally {
-    release();
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -113,6 +135,7 @@ function registerCtxTool(
   const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
     ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => withProjectToolLock(
         resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
+        ctx?.signal,
         () => handler(toolArgs, ctx),
       )
     : handler;
@@ -517,7 +540,7 @@ export interface BatchRunOptions {
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string; signal?: AbortSignal }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string; signal?: AbortSignal }): Promise<{ stdout: string; stderr?: string; timedOut?: boolean; timeoutMs?: number }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -619,8 +642,9 @@ export async function runBatchCommands(
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
   const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes, signal } = opts;
+  const effectiveConcurrency = Math.min(concurrency, getBatchConcurrencyLimit());
 
-  if (concurrency <= 1) {
+  if (effectiveConcurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
     // When `timeout` is undefined, no shared budget is enforced; each
     // command runs to completion (Issue #406).
@@ -675,13 +699,13 @@ export async function runBatchCommands(
       // markers are stripped + counted, even when the command timed out.
       const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
       const output = result.timedOut
-        ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
+        ? formatted.replace(/\n$/, "") + `\n(timed out after ${result.timeoutMs ?? timeout ?? "?"}ms)\n`
         : formatted;
       return { output, timedOut: !!result.timedOut };
     },
   }));
 
-  const { settled } = await runPool(jobs, { concurrency });
+  const { settled } = await runPool(jobs, { concurrency: effectiveConcurrency });
   const outputs: string[] = new Array(commands.length);
   let timedOut = false;
   for (let i = 0; i < settled.length; i++) {
@@ -839,7 +863,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
+                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${result.timeoutMs ?? timeout ?? "unknown"}ms — still running)_`,
               },
             ],
           };
@@ -850,7 +874,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
+                text: `${echo}${partialOutput}\n\n_(timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms — partial output shown above)_`,
               },
             ],
           };
@@ -859,7 +883,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           content: [
             {
               type: "text" as const,
-              text: `${echo}Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
+              text: `${echo}Execution timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms\n\nstderr:\n${result.stderr}`,
             },
           ],
           isError: true,
@@ -1092,7 +1116,7 @@ registerCtxTool(
           content: [
             {
               type: "text" as const,
-              text: `${echo}Timed out processing ${path} after ${timeout}ms`,
+              text: `${echo}Timed out processing ${path} after ${result.timeoutMs ?? timeout ?? "unknown"}ms`,
             },
           ],
           isError: true,
@@ -1365,6 +1389,10 @@ function readPositiveEnv(name: string, defaultValue: number): number {
   if (!raw) return defaultValue;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+export function getBatchConcurrencyLimit(): number {
+  return Math.min(8, Math.floor(readPositiveEnv("CONTEXT_MODE_MAX_BATCH_CONCURRENCY", 8)));
 }
 
 const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
@@ -2311,10 +2339,10 @@ registerCtxTool(
         .coerce.number()
         .int()
         .min(1)
-        .max(8)
+        .max(getBatchConcurrencyLimit())
         .optional()
         .default(1)
-        .describe("Parallel commands, 1-8; use 1 for stateful or CPU-bound work."),
+        .describe(`Parallel commands, 1-${getBatchConcurrencyLimit()}; use 1 for stateful or CPU-bound work.`),
       cwd: z
         .string()
         .optional()
@@ -2358,7 +2386,7 @@ registerCtxTool(
           content: [
             {
               type: "text" as const,
-              text: `Batch timed out after ${timeout}ms. No output captured.`,
+              text: `Batch timed out after ${timeout ?? "unknown"}ms. No output captured.`,
             },
           ],
           isError: true,
@@ -2449,6 +2477,9 @@ registerCtxTool(
   async () => {
     const lines: string[] = ["context-mode doctor", ""];
     lines.push(`[OK] Runtimes: ${available.length} — ${available.join(", ")}`);
+    const admission = configuredExecutionAdmissionError();
+    lines.push(admission ? `[WARN] Admission: ${admission}` : "[OK] Admission: ready");
+    lines.push(`[OK] Limits: min available ${process.env.CONTEXT_MODE_MIN_AVAILABLE_MB ?? "disabled"} MiB; foreground ${process.env.CONTEXT_MODE_MAX_FOREGROUND_MS ?? "unlimited"} ms; batch concurrency ${getBatchConcurrencyLimit()}`);
 
     try {
       lines.push(`[OK] Storage content: ${getContentDir()}`);
@@ -2679,6 +2710,25 @@ export function createContextModeNodeHttpServer(
   return createServer(async (req, res) => {
     if (!validateHost(req, res)) return;
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
+
+    if (path === "/readyz") {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { Allow: "GET, HEAD" });
+        res.end();
+        return;
+      }
+      const reason = configuredExecutionAdmissionError();
+      const body = JSON.stringify(reason
+        ? { status: "unavailable", reason }
+        : { status: "ready", version: VERSION });
+      res.writeHead(reason ? 503 : 200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": String(Buffer.byteLength(body)),
+      });
+      res.end(req.method === "HEAD" ? undefined : body);
+      return;
+    }
 
     if (path === "/healthz") {
       if (req.method !== "GET" && req.method !== "HEAD") {

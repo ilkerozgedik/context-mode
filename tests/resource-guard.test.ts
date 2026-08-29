@@ -2,8 +2,12 @@ import { describe, expect, test } from "vitest";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PolyglotExecutor } from "../src/executor.js";
-import { REGISTERED_CTX_TOOLS } from "../src/server.js";
+import {
+  PolyglotExecutor,
+  memoryAdmissionError,
+  resolveForegroundTimeout,
+} from "../src/executor.js";
+import { getBatchConcurrencyLimit, REGISTERED_CTX_TOOLS } from "../src/server.js";
 import { ContentStore } from "../src/store.js";
 
 describe("resource guards", () => {
@@ -27,6 +31,73 @@ describe("resource guards", () => {
       executor.cleanupBackgrounded();
     }
   });
+
+  test("cleanup terminates an active foreground process tree", async () => {
+    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const marker = join(tmpdir(), `context-mode-cleanup-${process.pid}-${Date.now()}`);
+    try {
+      const run = executor.execute({
+        language: "javascript",
+        code: `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 250); setTimeout(() => {}, 1000);`,
+        timeout: 5000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      executor.cleanupBackgrounded();
+      await run;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(marker, { force: true });
+      executor.cleanupBackgrounded();
+    }
+  });
+
+  test("does not execute an aborted request after it waits for the project lock", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
+    expect(execute).toBeDefined();
+    const marker = join(tmpdir(), `context-mode-queued-abort-${process.pid}-${Date.now()}`);
+    const controller = new AbortController();
+    try {
+      const first = execute!.handler({
+        language: "javascript",
+        code: "await new Promise((resolve) => setTimeout(resolve, 200)); console.log('first done')",
+        timeout: 1000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const queued = execute!.handler({
+        language: "javascript",
+        code: `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
+        timeout: 1000,
+      }, { signal: controller.signal });
+      controller.abort(new Error("request cancelled"));
+      await expect(queued).rejects.toThrow("request cancelled");
+      await first;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(marker, { force: true });
+    }
+  });
+
+  test("applies deployment memory and foreground timeout limits", () => {
+    expect(memoryAdmissionError("MemTotal: 1024 kB\nMemAvailable: 524288 kB\n", 768))
+      .toContain("512 MiB available");
+    expect(memoryAdmissionError("MemAvailable: 1048576 kB\n", 768)).toBeUndefined();
+    expect(memoryAdmissionError("MemAvailable: 1 kB\n", 0)).toBeUndefined();
+    expect(resolveForegroundTimeout(undefined, false, 45_000)).toBe(45_000);
+    expect(resolveForegroundTimeout(90_000, false, 45_000)).toBe(45_000);
+    expect(resolveForegroundTimeout(10_000, false, 45_000)).toBe(10_000);
+    expect(resolveForegroundTimeout(undefined, true, 45_000)).toBeUndefined();
+    const previousConcurrency = process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
+    try {
+      process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = "2";
+      expect(getBatchConcurrencyLimit()).toBe(2);
+    } finally {
+      if (previousConcurrency === undefined) delete process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
+      else process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = previousConcurrency;
+    }
+  });
+
   test("caps captured child output without killing the process", async () => {
     const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
     const marker = join(tmpdir(), `context-mode-output-cap-${process.pid}-${Date.now()}`);

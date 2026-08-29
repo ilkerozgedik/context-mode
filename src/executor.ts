@@ -1,5 +1,5 @@
 import { spawn, execSync, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -12,6 +12,40 @@ export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
 
 const isWin = process.platform === "win32";
+
+function readNonNegativeEnv(name: string): number {
+  const value = Number(process.env[name] ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function memoryAdmissionError(meminfo: string, minAvailableMb: number): string | undefined {
+  if (minAvailableMb <= 0) return undefined;
+  const match = meminfo.match(/^MemAvailable:\s+(\d+)\s+kB$/m);
+  if (!match) return undefined;
+  const availableMb = Math.floor(Number(match[1]) / 1024);
+  return availableMb < minAvailableMb
+    ? `Execution refused: ${availableMb} MiB available; requires ${minAvailableMb} MiB`
+    : undefined;
+}
+
+export function resolveForegroundTimeout(
+  timeout: number | undefined,
+  background: boolean,
+  maxForegroundMs: number,
+): number | undefined {
+  if (background || maxForegroundMs <= 0) return timeout;
+  return timeout === undefined ? maxForegroundMs : Math.min(timeout, maxForegroundMs);
+}
+
+export function configuredExecutionAdmissionError(): string | undefined {
+  const minimum = readNonNegativeEnv("CONTEXT_MODE_MIN_AVAILABLE_MB");
+  if (minimum <= 0 || process.platform !== "linux") return undefined;
+  try {
+    return memoryAdmissionError(readFileSync("/proc/meminfo", "utf8"), minimum);
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Pure helper: extension map for temp script files per language.
@@ -224,8 +258,8 @@ export class PolyglotExecutor {
   #projectRootResolver: () => string;
   #runtimes: RuntimeMap;
 
-  /** PIDs of backgrounded processes — killed on cleanup to prevent zombies. */
-  #backgroundedPids = new Set<number>();
+  /** Every live process group — killed on cleanup to prevent orphaned descendants. */
+  #activePids = new Set<number>();
 
   constructor(opts?: {
     hardCapBytes?: number;
@@ -252,19 +286,26 @@ export class PolyglotExecutor {
     return { ...this.#runtimes };
   }
 
-  /** Kill all backgrounded processes to prevent zombie/port-conflict issues. */
+  /** Kill all active process groups during server shutdown. */
   cleanupBackgrounded(): void {
-    for (const pid of this.#backgroundedPids) {
+    for (const pid of this.#activePids) {
       try {
         // Kill process group on Unix to catch all children
         process.kill(isWin ? pid : -pid, "SIGTERM");
       } catch { /* already dead */ }
     }
-    this.#backgroundedPids.clear();
+    this.#activePids.clear();
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
     const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
+    const admissionError = configuredExecutionAdmissionError();
+    if (admissionError) throw new Error(admissionError);
+    const effectiveTimeout = resolveForegroundTimeout(
+      timeout,
+      background,
+      readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"),
+    );
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -283,7 +324,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
+      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -355,6 +396,7 @@ export class PolyglotExecutor {
         windowsHide: process.platform === "win32",
         shell: false,
       });
+      if (proc.pid) this.#activePids.add(proc.pid);
 
       let timedOut = false;
       let resolved = false;
@@ -374,7 +416,6 @@ export class PolyglotExecutor {
         if (background) {
           // Background mode: detach process, return partial output, keep running
           resolved = true;
-          if (proc.pid) this.#backgroundedPids.add(proc.pid);
           proc.unref();
           // Do NOT destroy stdout/stderr — closing the read end of the pipe
           // sends SIGPIPE to the child on its next write, killing it.
@@ -400,6 +441,7 @@ export class PolyglotExecutor {
             stderr: rawStderr,
             exitCode: 0,
             timedOut: true,
+            timeoutMs: timeout,
             backgrounded: true,
           });
         } else {
@@ -430,6 +472,7 @@ export class PolyglotExecutor {
       proc.on("close", (exitCode) => {
         signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
+        if (proc.pid) this.#activePids.delete(proc.pid);
         if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
@@ -446,11 +489,14 @@ export class PolyglotExecutor {
           stderr,
           exitCode: timedOut ? 1 : (exitCode ?? 1),
           timedOut,
+          timeoutMs: timedOut ? timeout : undefined,
         });
       });
 
       proc.on("error", (err) => {
+        signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
+        if (proc.pid) this.#activePids.delete(proc.pid);
         if (resolved) return; // Already resolved by background timeout
         res({
           stdout: "",
