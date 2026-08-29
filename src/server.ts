@@ -13,6 +13,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor, configuredExecutionAdmissionError } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
+import { JobManager } from "./jobs.js";
 import { ContentStore, type IndexResult } from "./store.js";
 import {
   readToolDenyPatterns,
@@ -158,6 +159,7 @@ const executor = new PolyglotExecutor({
   runtimes,
   projectRoot: () => getProjectDir(),
 });
+const jobManager = new JobManager();
 
 // ─────────────────────────────────────────────────────────
 // FS read tracking preload for ctx_batch_execute
@@ -1050,6 +1052,62 @@ function intentSearch(
 }
 
 // ─────────────────────────────────────────────────────────
+
+// Tool: async job execution for long-running builds
+registerCtxTool(
+  "ctx_job_start",
+  {
+    description: "Start one long-running shell job under a resource-limited systemd user service. Returns immediately with a job receipt; runs with the MCP server OS permissions.",
+    inputSchema: z.object({
+      command: z.string().min(1).describe("Shell command to run."),
+      cwd: z.string().optional().describe("Working directory; defaults to the configured project directory."),
+      expected_artifacts: z.array(z.string().min(1)).max(16).optional().describe("Optional artifact paths inside cwd to report when present."),
+    }),
+  },
+  async ({ command, cwd, expected_artifacts }) => {
+    try {
+      const admissionError = configuredExecutionAdmissionError();
+      if (admissionError) throw new Error(admissionError);
+      const projectDir = resolveExecutionProjectDir(cwd);
+      const started = jobManager.start({ command, cwd: projectDir, expectedArtifacts: expected_artifacts });
+      return { content: [{ type: "text", text: JSON.stringify(jobManager.status(started.jobId)) }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
+    }
+  },
+);
+
+registerCtxTool(
+  "ctx_job_status",
+  {
+    description: "Read the current receipt for a previously started async job.",
+    inputSchema: z.object({ job_id: z.string().min(1) }),
+  },
+  async ({ job_id }) => {
+    try {
+      return { content: [{ type: "text", text: JSON.stringify(jobManager.status(job_id)) }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
+    }
+  },
+);
+
+registerCtxTool(
+  "ctx_job_cancel",
+  {
+    description: "Cancel the active async job and return its final receipt.",
+    inputSchema: z.object({ job_id: z.string().min(1) }),
+  },
+  async ({ job_id }) => {
+    try {
+      const receipt = await jobManager.cancel(job_id);
+      return { content: [{ type: "text", text: JSON.stringify(receipt) }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
+    }
+  },
+);
+
 // Tool: execute_file
 // ─────────────────────────────────────────────────────────
 
@@ -2708,6 +2766,7 @@ async function writeJsonRpcHttpError(res: ServerResponse, status: number, code: 
 }
 
 function cleanupRuntime(): void {
+  jobManager.cleanup();
   executor.cleanupBackgrounded();
   if (_store) {
     try { _store.close(); } catch {}

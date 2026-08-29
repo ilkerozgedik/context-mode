@@ -23,6 +23,7 @@ Modern clients are served natively using MCP revision `2026-07-28` with stateles
 The fork exposes only:
 
 - `ctx_execute`
+- `ctx_job_start` / `ctx_job_status` / `ctx_job_cancel`
 - `ctx_execute_file`
 - `ctx_index`
 - `ctx_search`
@@ -31,7 +32,7 @@ The fork exposes only:
 - `ctx_doctor`
 - `ctx_purge`
 
-Execution supports JavaScript, Python, and shell. Child processes run with the MCP server OS permissions, are resource-capped, and are terminated when the owning MCP request is cancelled. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
+Execution supports JavaScript, Python, and shell. `ctx_job_*` is the long-running shell path: one async job at a time, run by the user systemd manager with bounded CPU/memory/tasks/runtime, cancellable polling receipts, bounded log tails, and optional artifact metadata. Legacy `background=true` detach time is deployment-capped. Child processes run with the MCP server OS permissions. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
 
 ## Differences from upstream
 

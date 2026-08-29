@@ -96,6 +96,9 @@ describe("standalone MCP HTTP server", () => {
     expect(body.result?.cacheScope).toBe("private");
     expect(names).toEqual([
       "ctx_execute",
+      "ctx_job_start",
+      "ctx_job_status",
+      "ctx_job_cancel",
       "ctx_execute_file",
       "ctx_index",
       "ctx_search",

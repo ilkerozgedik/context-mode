@@ -37,6 +37,14 @@ export function resolveForegroundTimeout(
   return timeout === undefined ? maxForegroundMs : Math.min(timeout, maxForegroundMs);
 }
 
+export function resolveBackgroundDetachTimeout(
+  timeout: number | undefined,
+  maxDetachMs: number,
+): number | undefined {
+  if (maxDetachMs <= 0) return timeout;
+  return timeout === undefined ? maxDetachMs : Math.min(timeout, maxDetachMs);
+}
+
 export function configuredExecutionAdmissionError(): string | undefined {
   const minimum = readNonNegativeEnv("CONTEXT_MODE_MIN_AVAILABLE_MB");
   if (minimum <= 0 || process.platform !== "linux") return undefined;
@@ -298,11 +306,9 @@ export class PolyglotExecutor {
     const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
     const admissionError = configuredExecutionAdmissionError();
     if (admissionError) throw new Error(admissionError);
-    const effectiveTimeout = resolveForegroundTimeout(
-      timeout,
-      background,
-      readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"),
-    );
+    const effectiveTimeout = background
+      ? resolveBackgroundDetachTimeout(timeout, readNonNegativeEnv("CONTEXT_MODE_MAX_BACKGROUND_DETACH_MS"))
+      : resolveForegroundTimeout(timeout, false, readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"));
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {

@@ -7,6 +7,9 @@ import { REGISTERED_CTX_TOOLS, isDirectExecution, withProjectDirOverride } from 
 
 const EXPECTED_TOOLS = [
   "ctx_execute",
+  "ctx_job_start",
+  "ctx_job_status",
+  "ctx_job_cancel",
   "ctx_execute_file",
   "ctx_index",
   "ctx_search",
@@ -100,7 +103,7 @@ describe("context-mode tool surface", () => {
   });
 
   test("execution tools disclose that code uses the MCP server OS permissions", () => {
-    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute"]) {
+    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_job_start"]) {
       const tool = REGISTERED_CTX_TOOLS.find((candidate) => candidate.name === name);
       expect(tool?.config.description).toContain("OS permissions");
     }
