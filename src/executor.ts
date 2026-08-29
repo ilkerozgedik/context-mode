@@ -395,6 +395,13 @@ export class PolyglotExecutor {
       });
       if (proc.pid) this.#activePids.add(proc.pid);
 
+      // A foreground shell must not leak descendants after the shell exits.
+      // Use `exit`, not `close`: background children can keep stdio pipes open,
+      // delaying `close` until after the leaked work has already run.
+      proc.once("exit", () => {
+        if (!background) killTree(proc);
+      });
+
       let timedOut = false;
       let resolved = false;
       const abortExecution = () => {
@@ -469,6 +476,10 @@ export class PolyglotExecutor {
       proc.on("close", (exitCode) => {
         signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
+        if (!background) {
+          // Foreground calls must not leak descendants when user code backgrounds a command.
+          killTree(proc);
+        }
         if (proc.pid) this.#activePids.delete(proc.pid);
         if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
