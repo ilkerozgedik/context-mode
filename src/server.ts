@@ -642,7 +642,7 @@ export async function runBatchCommands(
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
   const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes, signal } = opts;
-  const effectiveConcurrency = Math.min(concurrency, getBatchConcurrencyLimit());
+  const effectiveConcurrency = resolveConfiguredConcurrency(concurrency);
 
   if (effectiveConcurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -1395,6 +1395,10 @@ export function getBatchConcurrencyLimit(): number {
   return Math.min(8, Math.floor(readPositiveEnv("CONTEXT_MODE_MAX_BATCH_CONCURRENCY", 8)));
 }
 
+export function resolveConfiguredConcurrency(requested: number): number {
+  return Math.min(Math.max(1, Math.floor(requested)), getBatchConcurrencyLimit());
+}
+
 const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
 const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3);
 const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8);
@@ -1970,8 +1974,15 @@ export function classifyIp(rawIp: string): "block" | "private" | "public" {
   return "public";
 }
 
-async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined, ttl: number | undefined): Promise<FetchOneResult> {
-  // SSRF guard — reject file://, javascript:, loopback, RFC1918, IMDS, link-local
+async function fetchOneUrl(
+  url: string,
+  source: string | undefined,
+  force: boolean | undefined,
+  ttl: number | undefined,
+  signal?: AbortSignal,
+): Promise<FetchOneResult> {
+ if (signal?.aborted) throw abortReason(signal);
+ // SSRF guard — reject file://, javascript:, loopback, RFC1918, IMDS, link-local
   // BEFORE any cache lookup or subprocess spawn. Even cached entries shouldn't
   // serve a previously-poisoned source label.
   const ssrfBlock = await ssrfGuard(url);
@@ -2006,7 +2017,9 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       language: "javascript",
       code: fetchCode,
       timeout: 30_000,
+      signal,
     });
+    if (signal?.aborted) throw abortReason(signal);
     if (result.exitCode !== 0) {
       // Subprocess fetch failure — undici / fetch can surface EAI_AGAIN /
       // ETIMEDOUT / ENETUNREACH in stderr when the resolver is overloaded
@@ -2043,6 +2056,7 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
     }
     return { kind: "fetched", url, source, markdown, header };
   } catch (err: unknown) {
+    if (signal?.aborted) throw abortReason(signal);
     return {
       kind: "fetch_error",
       url,
@@ -2135,7 +2149,7 @@ registerCtxTool(
         .describe("Cache TTL in ms; 0 bypasses cache."),
     }),
   },
-  async ({ url, source, requests, concurrency, force, ttl }) => {
+  async ({ url, source, requests, concurrency, force, ttl }, ctx) => {
     // Normalize input: legacy {url} or new {requests: [...]}.
     // requests wins when both are provided (explicit batch intent).
     const batch: { url: string; source?: string }[] = requests
@@ -2156,16 +2170,20 @@ registerCtxTool(
 
     const isLegacySingle = !requests && batch.length === 1;
     const requestedConcurrency = concurrency ?? 1;
+    const configuredConcurrency = resolveConfiguredConcurrency(requestedConcurrency);
+    const configuredCapped = configuredConcurrency < requestedConcurrency;
 
     // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
     // — single-URL doesn't need the cap (only one job, executor is one subprocess).
     const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
-      run: () => fetchOneUrl(req.url, req.source, force, ttl),
+      run: () => fetchOneUrl(req.url, req.source, force, ttl, ctx?.signal),
     }));
-    const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
-      concurrency: requestedConcurrency,
+    const pool = await runPool(jobs, {
+      concurrency: configuredConcurrency,
       capByCpuCount: !isLegacySingle && requestedConcurrency > 1,
     });
+    const { settled, effectiveConcurrency } = pool;
+    const capped = configuredCapped || pool.capped;
 
     // Serial index drain — workers race on fetch, but store.index* runs one at a time.
     type Finalized =
@@ -2176,6 +2194,7 @@ registerCtxTool(
 
     const finalized: Finalized[] = [];
     for (let i = 0; i < settled.length; i++) {
+      if (ctx?.signal?.aborted) throw abortReason(ctx.signal);
       const r = settled[i];
       if (r.status === "rejected") {
         const message = r.reason instanceof Error ? r.reason.message : String(r.reason);

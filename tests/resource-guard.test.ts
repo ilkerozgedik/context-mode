@@ -7,7 +7,8 @@ import {
   memoryAdmissionError,
   resolveForegroundTimeout,
 } from "../src/executor.js";
-import { getBatchConcurrencyLimit, REGISTERED_CTX_TOOLS } from "../src/server.js";
+import { getBatchConcurrencyLimit, resolveConfiguredConcurrency, REGISTERED_CTX_TOOLS } from "../src/server.js";
+import { runPool } from "../src/runPool.js";
 import { ContentStore } from "../src/store.js";
 
 describe("resource guards", () => {
@@ -38,7 +39,7 @@ describe("resource guards", () => {
     try {
       const run = executor.execute({
         language: "javascript",
-        code: `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 250); setTimeout(() => {}, 1000);`,
+        code: `process.on("SIGTERM", () => {}); const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 250); setTimeout(() => {}, 1000);`,
         timeout: 5000,
       });
       await new Promise((resolve) => setTimeout(resolve, 30));
@@ -92,6 +93,31 @@ describe("resource guards", () => {
     try {
       process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = "2";
       expect(getBatchConcurrencyLimit()).toBe(2);
+      expect(resolveConfiguredConcurrency(8)).toBe(2);
+      expect(resolveConfiguredConcurrency(0)).toBe(1);
+    } finally {
+      if (previousConcurrency === undefined) delete process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
+      else process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = previousConcurrency;
+    }
+  });
+
+  test("enforces the configured cap on a batch worker pool", async () => {
+    const previousConcurrency = process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
+    let inFlight = 0;
+    let peak = 0;
+    try {
+      process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = "1";
+      const jobs = Array.from({ length: 3 }, () => ({
+        run: async () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          inFlight -= 1;
+        },
+      }));
+      const result = await runPool(jobs, { concurrency: resolveConfiguredConcurrency(3) });
+      expect(result.settled.every((item) => item.status === "fulfilled")).toBe(true);
+      expect(peak).toBe(1);
     } finally {
       if (previousConcurrency === undefined) delete process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
       else process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = previousConcurrency;

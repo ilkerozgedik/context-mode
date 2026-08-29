@@ -210,7 +210,7 @@ function cleanupTmpDir(tmpDir: string): void {
 }
 
 /** Kill process tree — on Windows uses taskkill /T; on Unix kills the process group. */
-function killTree(proc: ReturnType<typeof spawn>): void {
+function killTree(proc: { pid?: number | undefined }): void {
   if (isWin && proc.pid) {
     try {
       execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "pipe" });
@@ -289,10 +289,7 @@ export class PolyglotExecutor {
   /** Kill all active process groups during server shutdown. */
   cleanupBackgrounded(): void {
     for (const pid of this.#activePids) {
-      try {
-        // Kill process group on Unix to catch all children
-        process.kill(isWin ? pid : -pid, "SIGTERM");
-      } catch { /* already dead */ }
+      killTree({ pid });
     }
     this.#activePids.clear();
   }
