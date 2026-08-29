@@ -181,6 +181,35 @@ describe("resource guards", () => {
     }
   });
 
+  test("batch execution supports POSIX compound shell commands", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-batch-compound-"));
+    const storage = mkdtempSync(join(tmpdir(), "context-mode-batch-compound-storage-"));
+    const previousStorage = process.env.CONTEXT_MODE_DIR;
+    process.env.CONTEXT_MODE_DIR = storage;
+    const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute");
+    const purge = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_purge");
+    try {
+      const result = await batch!.handler({
+        commands: [{ label: "compound", command: "if true; then printf compound-ok; fi" }],
+        queries: ["compound-ok"],
+        timeout: 5000,
+        concurrency: 1,
+        query_scope: "batch",
+        cwd: root,
+      }) as { isError?: boolean; content: Array<{ text: string }> };
+      const text = result.content.map((part) => part.text).join("\n");
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain("compound-ok");
+      expect(text).not.toContain("syntax error");
+    } finally {
+      await purge!.handler({ confirm: true, cwd: root });
+      if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
+      else process.env.CONTEXT_MODE_DIR = previousStorage;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
   test("caps batch indexing independently from execution capture", async () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-batch-"));
     const storage = mkdtempSync(join(tmpdir(), "context-mode-batch-storage-"));

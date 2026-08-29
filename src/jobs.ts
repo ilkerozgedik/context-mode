@@ -116,7 +116,7 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
 }
 
 export class SystemdJobRunner implements JobRunner {
-  readonly #memoryMaxMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_MAX_MB, 1536);
+  readonly #memoryMaxMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_MAX_MB, 2048);
   readonly #memorySwapMaxMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_SWAP_MAX_MB, 256);
   readonly #tasksMax = positiveInt(process.env.CONTEXT_MODE_JOB_TASKS_MAX, 128);
   readonly #cpuQuotaPercent = positiveInt(process.env.CONTEXT_MODE_JOB_CPU_QUOTA_PERCENT, 200);

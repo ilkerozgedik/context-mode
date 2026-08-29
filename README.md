@@ -32,7 +32,7 @@ The fork exposes only:
 - `ctx_doctor`
 - `ctx_purge`
 
-Execution supports JavaScript, Python, and shell. `ctx_job_*` is the long-running shell path: one async job at a time, run by the user systemd manager with bounded CPU/memory/tasks/runtime, cancellable polling receipts, bounded log tails, and optional artifact metadata. Legacy `background=true` detach time is deployment-capped. Child processes run with the MCP server OS permissions. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
+Execution supports JavaScript, Python, and shell. `ctx_job_*` is the long-running shell path: one async job at a time, run by the user systemd manager with bounded CPU/memory/tasks/runtime (2 GiB memory by default), cancellable polling receipts, bounded log tails, and optional artifact metadata. Legacy `background=true` detach time is deployment-capped. Child processes run with the MCP server OS permissions. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
 
 ## Differences from upstream
 
