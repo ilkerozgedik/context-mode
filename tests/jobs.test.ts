@@ -79,7 +79,8 @@ describe("async jobs", () => {
       unit: "context-mode-job-abc",
       cwd: "/tmp/project",
       command: "godot --headless --export-debug Android app.apk",
-      memoryMaxMb: 1536,
+      memoryHighMb: 2048,
+      memoryMaxMb: 2304,
       memorySwapMaxMb: 256,
       tasksMax: 128,
       cpuQuotaPercent: 200,
@@ -87,7 +88,8 @@ describe("async jobs", () => {
       path: "/usr/bin:/bin",
       home: "/home/test",
     });
-    expect(args).toContain("--property=MemoryMax=1536M");
+    expect(args).toContain("--property=MemoryHigh=2048M");
+    expect(args).toContain("--property=MemoryMax=2304M");
     expect(args).toContain("--property=MemorySwapMax=256M");
     expect(args).toContain("--property=TasksMax=128");
     expect(args).toContain("--property=CPUQuota=200%");
