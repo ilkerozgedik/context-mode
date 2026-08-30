@@ -16,7 +16,7 @@ context-mode --transport http --host 127.0.0.1 --port 3050
 
 The HTTP endpoint is `/mcp`; readiness is exposed at `/healthz`. HTTP mode is intentionally restricted to loopback and validates Host and Origin headers.
 
-Modern clients are served natively using MCP revision `2026-07-28` with stateless per-request server instances. A stateless legacy compatibility path remains enabled for 2025-era clients during migration; modern requests never use `Mcp-Session-Id`.
+Context Mode serves MCP revision `2026-07-28` only, using stateless per-request server instances. 2025-era `initialize` traffic and MCP sessions are rejected.
 
 ## Tool surface
 
@@ -32,7 +32,7 @@ The fork exposes only:
 - `ctx_doctor`
 - `ctx_purge`
 
-Execution supports JavaScript, Python, and shell. `ctx_execute` is foreground-only; legacy `background=true` is rejected with guidance to use `ctx_job_start`. `ctx_job_*` is the long-running shell path: one async job at a time, run by the user systemd manager with bounded CPU/memory/tasks/runtime (2 GiB soft memory pressure, 2.25 GiB hard cap by default), `NoNewPrivileges`, a private `0077` umask, deterministic non-login shell execution, restart-time stale-job reconciliation, live bounded log tails, cancellable polling receipts, systemd-aware termination reasons (`oom-kill`, `runtime-timeout`, `signal:N`, `exit:N`), and optional artifact metadata. Foreground execution is refused while an async job is active; deployments can additionally set a separate heavy-job memory admission threshold with `CONTEXT_MODE_JOB_MIN_AVAILABLE_MB`. Child processes run with the MCP server OS permissions. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
+Execution supports JavaScript, Python, and shell. `ctx_execute` is foreground-only; use `ctx_job_start` for long-running shell work. `ctx_job_*` is the long-running shell path: one async job at a time, run by the user systemd manager with bounded CPU/memory/tasks/runtime (2 GiB soft memory pressure, 2.25 GiB hard cap by default), `NoNewPrivileges`, a private `0077` umask, deterministic non-login shell execution, restart-time stale-job reconciliation, live bounded log tails, cancellable polling receipts, systemd-aware termination reasons (`oom-kill`, `runtime-timeout`, `signal:N`, `exit:N`), and optional artifact metadata. Foreground execution is refused while an async job is active; deployments can additionally set a separate heavy-job memory admission threshold with `CONTEXT_MODE_JOB_MIN_AVAILABLE_MB`. Child processes run with the MCP server OS permissions. Indexed content is stored in a persistent SQLite/FTS5 database until explicit purge.
 
 ## Differences from upstream
 
@@ -40,7 +40,7 @@ Execution supports JavaScript, Python, and shell. `ctx_execute` is foreground-on
 - Uses concise MCP metadata to reduce tool-list context cost.
 - Supports standalone stdio and Streamable HTTP transports.
 - Uses fresh MCP server instances for HTTP requests.
-- Enforces the required 2026-07-28 standard request headers, including the SDK v2 missing-header compatibility guard.
+- Enforces the required 2026-07-28 standard request headers, including an SDK v2 missing-header guard.
 - Keeps output, fetch-size, SSRF, path-boundary, concurrency, and SQLite safety guards.
 
 ## Development

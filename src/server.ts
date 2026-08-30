@@ -5,7 +5,7 @@ import { localhostHostValidation, localhostOriginValidation, toNodeHandler } fro
 import { createServer, type IncomingMessage, type Server as NodeHttpServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { accessSync, constants, existsSync, mkdirSync, renameSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync, writeSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
@@ -218,27 +218,12 @@ function normalizeProjectPath(projectDir: string): string {
     : normalized;
 }
 
-function projectHash(projectDir: string, canonical = true): string {
-  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-  const value = canonical ? normalizeProjectPath(projectDir) : normalized;
-  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+function projectHash(projectDir: string): string {
+  return createHash("sha256").update(normalizeProjectPath(projectDir)).digest("hex").slice(0, 16);
 }
 
 function getStorePath(projectDir: string = getProjectDir()): string {
-  const dir = getContentDir();
-  const canonicalPath = join(dir, `${projectHash(projectDir)}.db`);
-  if (existsSync(canonicalPath)) return canonicalPath;
-
-  const legacyPath = join(dir, `${projectHash(projectDir, false)}.db`);
-  if (legacyPath !== canonicalPath && existsSync(legacyPath)) {
-    try {
-      renameSync(legacyPath, canonicalPath);
-      for (const suffix of ["-wal", "-shm"]) {
-        try { renameSync(legacyPath + suffix, canonicalPath + suffix); } catch {}
-      }
-    } catch {}
-  }
-  return canonicalPath;
+  return join(getContentDir(), `${projectHash(projectDir)}.db`);
 }
 
 function getStore(projectDir: string = getProjectDir()): ContentStore {
@@ -638,7 +623,7 @@ function combineExecOutput(result: { stdout?: string; stderr?: string }): string
 }
 
 /**
- * Execute batch commands. concurrency=1 preserves the legacy serial path
+ * Execute batch commands. concurrency=1 preserves deterministic serial execution
  * (shared timeout budget + cascading skip-on-timeout). concurrency>1 runs
  * commands concurrently with at most N in flight; each command receives the
  * full timeout, output is collated by input index, and per-command timeouts
@@ -748,7 +733,7 @@ registerCtxTool(
       openWorldHint: true,
     },
     description: "Run code as a child process with the MCP server OS permissions. Print only findings that should enter context; use ctx_batch_execute for related commands.",
-    inputSchema: z.object({
+    inputSchema: z.strictObject({
       language: z
 .enum(["javascript", "python", "shell"])
         .describe("Runtime language"),
@@ -759,11 +744,6 @@ registerCtxTool(
         .coerce.number()
         .optional()
         .describe("Max execution time in ms; omit to use the MCP host timeout."),
-      background: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("Deprecated compatibility flag. true is rejected; use ctx_job_start for long-running work."),
       cwd: z
         .string()
         .optional()
@@ -774,14 +754,8 @@ registerCtxTool(
         .describe("Terms to match when large output is indexed."),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }, ctx) => {
+  async ({ language, code, timeout, cwd, intent }, ctx) => {
     try {
-      if (background) {
-        return {
-          isError: true,
-          content: [{ type: "text" as const, text: "background execution was removed; use ctx_job_start for long-running work" }],
-        };
-      }
       // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
       if (language === "javascript") {
@@ -2181,19 +2155,14 @@ registerCtxTool(
       openWorldHint: true,
     },
     description: "Fetch and index URL content server-side so raw pages stay out of context. Use ctx_search for follow-up retrieval.",
-    inputSchema: z.object({
+    inputSchema: z.strictObject({
       cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
-      url: z.string().optional().describe("Single URL to fetch and index"),
-      source: z
-        .string()
-        .optional()
-        .describe("Label for a single URL; batch requests can set their own source."),
       requests: z.array(
         z.object({
           url: z.string().describe("URL to fetch"),
           source: z.string().optional().describe("Label for this URL's indexed content"),
         }),
-      ).min(1).optional().describe("Batch of {url, source?} entries."),
+      ).min(1).describe("URLs to fetch and index."),
       concurrency: z
         .coerce.number()
         .int()
@@ -2214,26 +2183,8 @@ registerCtxTool(
         .describe("Cache TTL in ms; 0 bypasses cache."),
     }),
   },
-  async ({ url, source, requests, concurrency, force, ttl }, ctx) => {
-    // Normalize input: legacy {url} or new {requests: [...]}.
-    // requests wins when both are provided (explicit batch intent).
-    const batch: { url: string; source?: string }[] = requests
-      ? requests
-      : url
-        ? [{ url, source }]
-        : [];
-
-    if (batch.length === 0) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: "ctx_fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
-        }],
-        isError: true,
-      };
-    }
-
-    const isLegacySingle = !requests && batch.length === 1;
+  async ({ requests, concurrency, force, ttl }, ctx) => {
+    const batch: { url: string; source?: string }[] = requests;
     const requestedConcurrency = concurrency ?? 1;
     const configuredConcurrency = resolveConfiguredConcurrency(requestedConcurrency);
     const configuredCapped = configuredConcurrency < requestedConcurrency;
@@ -2245,7 +2196,7 @@ registerCtxTool(
     }));
     const pool = await runPool(jobs, {
       concurrency: configuredConcurrency,
-      capByCpuCount: !isLegacySingle && requestedConcurrency > 1,
+      capByCpuCount: requestedConcurrency > 1,
     });
     const { settled, effectiveConcurrency } = pool;
     const capped = configuredCapped || pool.capped;
@@ -2276,50 +2227,6 @@ registerCtxTool(
         // Cache miss: fetch and index the content.
         finalized.push({ kind: "fetched", indexed: indexFetched(v) });
       }
-    }
-
-    // Backward-compat single-URL response shape — preserve the EXACT original wording.
-    if (isLegacySingle) {
-      const r = finalized[0];
-      if (r.kind === "cached") {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: ${r.ttlStr}).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
-          }],
-        };
-      }
-      if (r.kind === "fetched") {
-        const totalKB = (r.indexed.totalBytes / 1024).toFixed(1);
-        const text = [
-          `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
-          `Full content indexed in the persistent store — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
-          "",
-          "---",
-          "",
-          r.indexed.preview,
-        ].join("\n");
-        return {
-          content: [{ type: "text" as const, text }],
-        };
-      }
-      // fetch_error — preserve original error wording per reason
-      if (r.kind === "fetch_error") {
-        const text =
-          r.reason === "empty" ? `Fetched ${r.url} but got empty content`
-          : r.reason === "read" ? `Fetched ${r.url} but could not read subprocess output`
-          : r.reason === "exit" ? `Failed to fetch ${r.url}: ${r.error}`
-          : /* throw */         `Fetch error: ${r.error}`;
-        return {
-          content: [{ type: "text" as const, text }],
-          isError: true,
-        };
-      }
-      // job_error
-      return {
-        content: [{ type: "text" as const, text: `Fetch error: ${r.error}` }],
-        isError: true,
-      };
     }
 
     // Batch response — aggregated summary; isError only when EVERY URL failed.
@@ -2506,7 +2413,7 @@ registerCtxTool(
         sectionTitles.push(s.title);
       }
 
-      // Run all search queries — default scope is batch-local (legacy behavior).
+      // Run all search queries — default scope is batch-local.
       // When the caller passes query_scope: "global", searches reach the entire
       // persistent index in the same round trip. Cross-source search remains
       // available via explicit ctx_search() as well.
@@ -2643,8 +2550,6 @@ registerCtxTool(
       const currentDir = getContentDir();
       const paths = new Set([
         join(currentDir, `${projectHash(projectDir)}.db`),
-        join(currentDir, `${projectHash(projectDir, false)}.db`),
-        join(homedir(), ".context-mode", "content", `${projectHash(projectDir, false)}.db`),
       ]);
       let deleted = 0;
       for (const path of paths) if (deleteDbFamily(path)) deleted++;
@@ -2723,7 +2628,7 @@ async function validateModernStandardHeaders(request: Request, parsedBody?: unkn
 
 export function createContextModeHttpHandler(): McpHttpHandler {
   const inner = createMcpHandler(() => createContextModeServer(), {
-    legacy: "stateless",
+    legacy: "reject",
     onerror: (error) => process.stderr.write(`[context-mode] MCP HTTP error: ${error.message}\n`),
   });
   return {
@@ -2935,7 +2840,7 @@ async function main() {
 
   if (args.transport === "stdio") {
     stdioHandle = serveStdio(() => createContextModeServer(), {
-      legacy: "serve",
+      legacy: "reject",
       onerror: (error) => process.stderr.write(`[context-mode] stdio error: ${error.message}\n`),
     });
     if (process.stdin.isTTY) {

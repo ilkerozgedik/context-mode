@@ -124,13 +124,18 @@ describe("context-mode tool surface", () => {
     }));
   });
 
-  test("ctx_execute rejects legacy background detach and points callers to ctx_job_start", async () => {
+  test("ctx_execute rejects the removed background compatibility argument", () => {
     const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
-    const result = await execute.handler({ language: "shell", code: "echo should-not-run", background: true }) as {
-      isError?: boolean; content: Array<{ text: string }>;
-    };
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/background.*removed.*ctx_job_start/i);
+    const schema = execute.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(schema.safeParse({ language: "shell", code: "echo should-not-run", background: true }).success).toBe(false);
+  });
+
+  test("ctx_fetch_and_index requires the canonical requests array", () => {
+    const fetchTool = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_fetch_and_index")!;
+    const schema = fetchTool.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(schema.safeParse({ requests: [{ url: "https://example.com", source: "example" }] }).success).toBe(true);
+    expect(schema.safeParse({ url: "https://example.com", source: "example" }).success).toBe(false);
+    expect(schema.safeParse({}).success).toBe(false);
   });
 
   test("foreground execution is refused while an async job is active", async () => {

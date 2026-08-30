@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
 import { isPathInsideProject } from "../src/security.js";
@@ -30,7 +31,7 @@ describe("runtime and executor", () => {
   });
 
   test("executes JavaScript in the project root", async () => {
-    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const executor = new PolyglotExecutor({ projectRoot: () => process.cwd() });
     try {
       const result = await executor.execute({
         language: "javascript",
@@ -54,6 +55,42 @@ describe("security", () => {
 });
 
 describe("persistent core", () => {
+  test("rejects unsupported legacy store schemas instead of mutating them", () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "legacy.db");
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        code_chunk_count INTEGER NOT NULL DEFAULT 0,
+        indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE VIRTUAL TABLE chunks USING fts5(
+        title, content, source_id UNINDEXED, content_type UNINDEXED,
+        tokenize='porter unicode61'
+      );
+      CREATE VIRTUAL TABLE chunks_trigram USING fts5(
+        title, content, source_id UNINDEXED, content_type UNINDEXED,
+        tokenize='trigram'
+      );
+    `);
+    db.close();
+
+    expect(() => new ContentStore(dbPath)).toThrow(/unsupported.*schema|purge.*reindex/i);
+
+    const verify = new Database(dbPath, { readonly: true });
+    try {
+      const chunkColumns = (verify.prepare("PRAGMA table_xinfo('chunks')").all() as Array<{ name: string }>).map((row) => row.name);
+      const sourceColumns = (verify.prepare("PRAGMA table_info('sources')").all() as Array<{ name: string }>).map((row) => row.name);
+      expect(chunkColumns).not.toContain("source_category");
+      expect(sourceColumns).not.toContain("file_path");
+    } finally {
+      verify.close();
+    }
+  });
+
   test("indexes and searches content with FTS5", () => {
     const dir = tempDir();
     const store = new ContentStore(join(dir, "content.db"));

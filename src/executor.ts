@@ -257,8 +257,7 @@ export class PolyglotExecutor {
    * Resolves the project root on every access. Stored as a thunk so the
    * executor stays in sync with server-side env-cascade resolvers (e.g.
    * `getProjectDir` in server.ts) instead of capturing a snapshot of
-   * `CLAUDE_PROJECT_DIR` at construction time. String inputs are wrapped
-   * to preserve constructor backward compatibility.
+   * `CLAUDE_PROJECT_DIR` at construction time.
    */
   #projectRootResolver: () => string;
   #runtimes: RuntimeMap;
@@ -268,18 +267,11 @@ export class PolyglotExecutor {
 
   constructor(opts?: {
     hardCapBytes?: number;
-    projectRoot?: string | (() => string);
+    projectRoot?: () => string;
     runtimes?: RuntimeMap;
   }) {
     this.#hardCapBytes = opts?.hardCapBytes ?? 8 * 1024 * 1024; // 8MB
-    const pr = opts?.projectRoot;
-    if (typeof pr === "function") {
-      this.#projectRootResolver = pr;
-    } else if (typeof pr === "string") {
-      this.#projectRootResolver = () => pr;
-    } else {
-      this.#projectRootResolver = () => process.cwd();
-    }
+    this.#projectRootResolver = opts?.projectRoot ?? (() => process.cwd());
     this.#runtimes = opts?.runtimes ?? detectRuntimes();
   }
 

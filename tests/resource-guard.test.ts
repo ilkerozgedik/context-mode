@@ -14,7 +14,7 @@ import { ContentStore } from "../src/store.js";
 
 describe("resource guards", () => {
   test("cancels the spawned process tree when the request aborts", async () => {
-    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const executor = new PolyglotExecutor({ projectRoot: () => process.cwd() });
     const marker = join(tmpdir(), `context-mode-abort-${process.pid}-${Date.now()}`);
     const controller = new AbortController();
     try {
@@ -35,7 +35,7 @@ describe("resource guards", () => {
   });
 
   test("cleanup terminates an active foreground process tree", async () => {
-    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const executor = new PolyglotExecutor({ projectRoot: () => process.cwd() });
     const marker = join(tmpdir(), `context-mode-cleanup-${process.pid}-${Date.now()}`);
     try {
       const run = executor.execute({
@@ -138,7 +138,7 @@ describe("resource guards", () => {
   });
 
   test("caps captured child output without killing the process", async () => {
-    const executor = new PolyglotExecutor({ projectRoot: process.cwd() });
+    const executor = new PolyglotExecutor({ projectRoot: () => process.cwd() });
     const marker = join(tmpdir(), `context-mode-output-cap-${process.pid}-${Date.now()}`);
     try {
       const result = await executor.execute({

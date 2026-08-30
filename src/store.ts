@@ -368,6 +368,27 @@ export class ContentStore {
   // ── Schema ──
 
   #initSchema(): void {
+    const existing = new Set((this.#db.prepare(
+      "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view')",
+    ).all() as Array<{ name: string }>).map((row) => row.name));
+    const managedTables = ["sources", "chunks", "chunks_trigram"];
+    if (managedTables.some((name) => existing.has(name))) {
+      const required = new Map<string, string[]>([
+        ["sources", ["id", "label", "chunk_count", "code_chunk_count", "indexed_at", "file_path", "content_hash"]],
+        ["chunks", ["title", "content", "source_id", "content_type", "source_category", "timestamp"]],
+        ["chunks_trigram", ["title", "content", "source_id", "content_type", "source_category", "timestamp"]],
+      ]);
+      for (const [table, columns] of required) {
+        if (!existing.has(table)) {
+          throw new Error(`Unsupported content store schema: missing ${table}; purge and reindex required`);
+        }
+        const actual = new Set((this.#db.prepare(`PRAGMA table_xinfo('${table}')`).all() as Array<{ name: string }>).map((row) => row.name));
+        if (columns.some((column) => !actual.has(column))) {
+          throw new Error(`Unsupported content store schema in ${table}; purge and reindex required`);
+        }
+      }
+    }
+
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,48 +427,6 @@ export class ContentStore {
       CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
     `);
 
-    // FTS5 schema migration: old schema (4 cols) → current schema.
-    // FTS5 virtual tables do not support ALTER TABLE ADD COLUMN, so we must
-    // DROP + re-CREATE. Detection: check for sentinel column `source_category`
-    // via pragma_table_xinfo. Three states:
-    //   1. No table          → CREATE above handled it (fresh DB)
-    //   2. Old schema (4 cols) → DROP + CREATE new
-    //   3. New schema (8 cols) → do nothing
-    try {
-      const cols = this.#db.prepare(
-        "SELECT name FROM pragma_table_xinfo('chunks')"
-      ).all() as Array<{ name: string }>;
-      const colNames = new Set(cols.map(c => c.name));
-      if (cols.length > 0 && !colNames.has("source_category")) {
-        // Old schema detected — drop both FTS5 tables and re-create with new columns
-        this.#db.exec("DROP TABLE IF EXISTS chunks");
-        this.#db.exec("DROP TABLE IF EXISTS chunks_trigram");
-        this.#db.exec(`
-          CREATE VIRTUAL TABLE chunks USING fts5(
-            title,
-            content,
-            source_id UNINDEXED,
-            content_type UNINDEXED,
-            source_category UNINDEXED,
-            timestamp UNINDEXED,
-            tokenize='porter unicode61'
-          );
-          CREATE VIRTUAL TABLE chunks_trigram USING fts5(
-            title,
-            content,
-            source_id UNINDEXED,
-            content_type UNINDEXED,
-            source_category UNINDEXED,
-            timestamp UNINDEXED,
-            tokenize='trigram'
-          );
-        `);
-      }
-    } catch { /* pragma_table_xinfo may fail if table doesn't exist yet — safe to ignore */ }
-
-    // Stale detection columns — safe for existing DBs (ALTER is O(1) in SQLite)
-    try { this.#db.exec("ALTER TABLE sources ADD COLUMN file_path TEXT"); } catch { /* already exists */ }
-    try { this.#db.exec("ALTER TABLE sources ADD COLUMN content_hash TEXT"); } catch { /* already exists */ }
   }
 
   #prepareStatements(): void {

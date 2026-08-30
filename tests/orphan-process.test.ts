@@ -15,7 +15,7 @@ describe("foreground process cleanup", () => {
       const root = mkdtempSync(join(tmpdir(), "context-mode-orphan-test-"));
       const marker = join(root, "escaped-child.marker");
       try {
-        const executor = new PolyglotExecutor({ projectRoot: root });
+        const executor = new PolyglotExecutor({ projectRoot: () => root });
         const result = await executor.execute({
           language: "shell",
           code: `(sleep 0.2; printf escaped > ${shellQuote(marker)}) &`,
