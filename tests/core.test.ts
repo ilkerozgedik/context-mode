@@ -7,6 +7,7 @@ import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
 import { isPathInsideProject } from "../src/security.js";
 import { ContentStore } from "../src/store.js";
+import { buildFetchCode, readResponseTextWithLimit } from "../src/fetch.js";
 
 const tempDirs: string[] = [];
 function tempDir(): string {
@@ -109,4 +110,41 @@ describe("persistent core", () => {
   });
 
 
+});
+
+
+describe("bounded fetch body reader", () => {
+  test("rejects oversized declared content before reading the body", async () => {
+    const response = new Response("abc", { headers: { "content-length": "10" } });
+    await expect(readResponseTextWithLimit(response, 5)).rejects.toThrow(/Content-Length 10 exceeds 5/);
+  });
+
+  test("stops a chunked response as soon as the byte cap is crossed", async () => {
+    let cancelled = false;
+    const chunks = [new Uint8Array(4), new Uint8Array(4)];
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+      cancel() { cancelled = true; },
+    }));
+
+    await expect(readResponseTextWithLimit(response, 5)).rejects.toThrow(/8 bytes exceeds 5/);
+    expect(cancelled).toBe(true);
+  });
+
+  test("counts UTF-8 bytes rather than JavaScript characters", async () => {
+    const bytes = new TextEncoder().encode("🙂");
+    await expect(readResponseTextWithLimit(new Response(bytes), 3)).rejects.toThrow(/4 bytes exceeds 3/);
+    await expect(readResponseTextWithLimit(new Response(bytes), 4)).resolves.toBe("🙂");
+  });
+
+  test("embeds the production byte limit explicitly in fetch subprocess code", () => {
+    const code = buildFetchCode("https://example.com", "/tmp/context-mode-fetch-test");
+    expect(code).toContain("resp, 52428800");
+    expect(code).toContain("getReader()");
+    expect(code).not.toContain("await resp.text()");
+  });
 });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REGISTERED_CTX_TOOLS, isDirectExecution, withProjectDirOverride } from "../src/server.js";
-import { resolveProjectScope } from "../src/project-context.js";
+import { resolveExecutionProjectDir, resolveProjectScope } from "../src/project-context.js";
 import { createToolRegistry } from "../src/tools/registry.js";
 
 const EXPECTED_TOOLS = [
@@ -132,12 +132,40 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({ language: "shell", code: "echo should-not-run", background: true }).success).toBe(false);
   });
 
+  test("ctx_batch_execute caps a request at eight commands", () => {
+    const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute")!;
+    const schema = batch.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    const command = { label: "x", command: "true" };
+    expect(schema.safeParse({ commands: Array.from({ length: 8 }, () => command), queries: ["x"] }).success).toBe(true);
+    expect(schema.safeParse({ commands: Array.from({ length: 9 }, () => command), queries: ["x"] }).success).toBe(false);
+  });
+
   test("ctx_fetch_and_index requires the canonical requests array", () => {
     const fetchTool = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_fetch_and_index")!;
     const schema = fetchTool.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
     expect(schema.safeParse({ requests: [{ url: "https://example.com", source: "example" }] }).success).toBe(true);
     expect(schema.safeParse({ url: "https://example.com", source: "example" }).success).toBe(false);
     expect(schema.safeParse({}).success).toBe(false);
+  });
+
+  test("resolves relative cwd once while locking by canonical project scope", async () => {
+    const base = mkdtempSync(join(tmpdir(), "context-mode-relative-base-"));
+    const repo = join(base, "work", "repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    const registry = createToolRegistry(() => false);
+    const execute = registry.register("ctx_execute", {}, async (args: { cwd: string }) => ({
+      content: [{ type: "text", text: JSON.stringify({ cwd: args.cwd, resolved: resolveExecutionProjectDir(args.cwd) }) }],
+    })) as (args: { cwd: string }) => Promise<{ content: Array<{ text: string }> }>;
+    try {
+      await withProjectDirOverride(base, async () => {
+        const result = await execute({ cwd: "work/repo" });
+        const observed = JSON.parse(result.content[0].text);
+        expect(observed.cwd).toBe(repo);
+        expect(observed.resolved).toBe(repo);
+      });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 
   test("foreground execution is blocked only for the project with an active async job", async () => {

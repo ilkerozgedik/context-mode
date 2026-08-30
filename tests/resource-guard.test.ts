@@ -9,6 +9,7 @@ import {
   resolveForegroundTimeout,
 } from "../src/executor.js";
 import { getBatchConcurrencyLimit, resolveConfiguredConcurrency, REGISTERED_CTX_TOOLS } from "../src/server.js";
+import { BATCH_COMMAND_CAPTURE_BYTES, runBatchCommands } from "../src/batch.js";
 import { runPool } from "../src/runPool.js";
 import { ContentStore } from "../src/store.js";
 import { createToolRegistry } from "../src/tools/registry.js";
@@ -136,6 +137,25 @@ describe("resource guards", () => {
       if (previousConcurrency === undefined) delete process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
       else process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = previousConcurrency;
     }
+  });
+
+  test("gives every batch command a bounded 4 MiB capture budget", async () => {
+    const seen: Array<number | undefined> = [];
+    const executor = {
+      execute: async (input: { captureLimitBytes?: number }) => {
+        seen.push(input.captureLimitBytes);
+        return { stdout: "ok", stderr: "", timedOut: false };
+      },
+    };
+    const result = await runBatchCommands(
+      Array.from({ length: 8 }, (_, i) => ({ label: `cmd-${i}`, command: "true" })),
+      { timeout: 5000, concurrency: 2, nodeOptsPrefix: "" },
+      executor,
+    );
+    expect(result.outputs).toHaveLength(8);
+    expect(seen).toHaveLength(8);
+    expect(seen.every((value) => value === BATCH_COMMAND_CAPTURE_BYTES)).toBe(true);
+    expect(BATCH_COMMAND_CAPTURE_BYTES).toBe(4 * 1024 * 1024);
   });
 
   test("caps captured child output without killing the process", async () => {

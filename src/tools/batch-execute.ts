@@ -68,7 +68,8 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
             }),
           )
           .min(1)
-          .describe("Commands to run; labels become indexed section headers."),
+          .max(8)
+          .describe("Commands to run; labels become indexed section headers (max 8)."),
         queries: z.array(z.string())
           .min(1)
           .describe("Queries to extract from indexed batch output."),

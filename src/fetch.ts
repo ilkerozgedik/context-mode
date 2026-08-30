@@ -11,6 +11,40 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Request cancelled");
 }
 
+export const MAX_FETCH_BYTES = 50 * 1024 * 1024;
+
+export async function readResponseTextWithLimit(
+  resp: Response,
+  maxBytes: number = MAX_FETCH_BYTES,
+): Promise<string> {
+  const declared = Number.parseInt(resp.headers.get("content-length") || "0", 10);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`Response too large: Content-Length ${declared} exceeds ${maxBytes}`);
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        throw new Error(`Response too large: ${totalBytes} bytes exceeds ${maxBytes}`);
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 // ─────────────────────────────────────────────────────────
 // Turndown path resolution (external dep, like better-sqlite3)
 // ─────────────────────────────────────────────────────────
@@ -69,6 +103,7 @@ export function buildFetchCode(url: string, outputPath: string): string {
     classifyIpFnName === "classifyIp"
       ? `var classifyIp = ${classifyIpInner};`
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
+  const safeTextSrc = readResponseTextWithLimit.toString();
   const strictMode = process.env.CTX_FETCH_STRICT === "1";
   return `
 const TurndownService = require(${turndownPath});
@@ -263,24 +298,10 @@ async function fetchWithManualRedirect(initialUrl) {
   throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
 }
 
-// Subprocess response-body size cap. A malicious or unexpectedly large
-// endpoint reachable through ctx_fetch_and_index would otherwise stream
-// gigabytes into resp.text(), then into outputPath, then into the parent
-// MCP server's heap via readFileSync. 50 MB is far above typical web
-// page / API response sizes (~1-5 MB) but bounded enough to keep parent
-// heap survivable. Cap both early via Content-Length and after the read.
-const MAX_FETCH_BYTES = 50 * 1024 * 1024;
-async function safeText(resp) {
-  const cl = parseInt(resp.headers.get('content-length') || '0', 10);
-  if (cl > MAX_FETCH_BYTES) {
-    throw new Error('Response too large: Content-Length ' + cl + ' exceeds ' + MAX_FETCH_BYTES);
-  }
-  const text = await resp.text();
-  if (text.length > MAX_FETCH_BYTES) {
-    throw new Error('Response too large: ' + text.length + ' bytes exceeds ' + MAX_FETCH_BYTES);
-  }
-  return text;
-}
+// Stream-level response-body cap: chunked/no-content-length responses are
+// rejected as soon as the byte budget is crossed instead of after resp.text()
+// has already accumulated the entire body in memory.
+const safeText = (resp) => (${safeTextSrc})(resp, ${MAX_FETCH_BYTES});
 
 async function main() {
   const resp = await fetchWithManualRedirect(url);

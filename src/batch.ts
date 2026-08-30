@@ -24,6 +24,7 @@ interface BatchExecutor {
     timeout: number | undefined;
     cwd?: string;
     signal?: AbortSignal;
+    captureLimitBytes?: number;
   }): Promise<{ stdout: string; stderr?: string; timedOut?: boolean; timeoutMs?: number }>;
 }
 
@@ -99,6 +100,8 @@ function combineExecOutput(result: { stdout?: string; stderr?: string }): string
   return `${stdout}${stdout.endsWith("\n") ? "" : "\n"}${stderr}`;
 }
 
+export const BATCH_COMMAND_CAPTURE_BYTES = 4 * 1024 * 1024;
+
 export async function runBatchCommands(
   commands: BatchCommand[],
   opts: BatchRunOptions,
@@ -123,7 +126,7 @@ export async function runBatchCommands(
         perCmdTimeout = remaining;
       }
       const result = await executor.execute({
-        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout: perCmdTimeout, cwd, signal,
+        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout: perCmdTimeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
       outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
       if (result.timedOut) {
@@ -140,7 +143,7 @@ export async function runBatchCommands(
   const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
     run: async () => {
       const result = await executor.execute({
-        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout, cwd, signal,
+        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
       const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
       const output = result.timedOut

@@ -245,6 +245,8 @@ interface ExecuteOptions {
   cwd?: string;
   /** Cancel the running process tree when the MCP request is aborted. */
   signal?: AbortSignal;
+  /** Internal per-call capture budget; public ctx_execute keeps the default cap. */
+  captureLimitBytes?: number;
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -292,7 +294,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, cwd: cwdOverride, signal } = opts;
+    const { language, code, timeout, cwd: cwdOverride, signal, captureLimitBytes } = opts;
     const admissionError = configuredExecutionAdmissionError();
     if (admissionError) throw new Error(admissionError);
     const effectiveTimeout = resolveForegroundTimeout(timeout, readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"));
@@ -314,7 +316,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, signal);
+      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, signal, captureLimitBytes);
       cleanupTmpDir(tmpDir);
       return result;
     } catch (err) {
@@ -366,6 +368,7 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     signal?: AbortSignal,
+    captureLimitBytes?: number,
   ): Promise<ExecResult> {
     return new Promise((res) => {
       const spawnCmd = cmd[0];
@@ -409,11 +412,12 @@ export class PolyglotExecutor {
       // while continuing to drain excess output so verbose commands can finish.
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
+      const hardCapBytes = captureLimitBytes ?? this.#hardCapBytes;
       let capturedBytes = 0;
       let capExceeded = false;
 
       const capture = (chunks: Buffer[], chunk: Buffer) => {
-        const remaining = this.#hardCapBytes - capturedBytes;
+        const remaining = hardCapBytes - capturedBytes;
         if (remaining > 0) {
           const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
           chunks.push(kept);
@@ -435,7 +439,7 @@ export class PolyglotExecutor {
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
 
         if (capExceeded) {
-          rawStderr += `\n[output capped at ${(this.#hardCapBytes / 1024 / 1024).toFixed(0)}MB — excess output discarded]`;
+          rawStderr += `\n[output capped at ${(hardCapBytes / 1024 / 1024).toFixed(0)}MB — excess output discarded]`;
         }
 
         const stdout = rawStdout;

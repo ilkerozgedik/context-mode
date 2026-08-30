@@ -34,11 +34,11 @@ export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boo
   const projectToolLocks = new Map<string, Promise<void>>();
 
   async function withProjectToolLock<T>(
-    projectDir: string,
+    executionDir: string,
     signal: AbortSignal | undefined,
-    fn: () => Promise<T> | T,
+    fn: (projectScope: string) => Promise<T> | T,
   ): Promise<T> {
-    const projectScope = resolveProjectScope(projectDir);
+    const projectScope = resolveProjectScope(executionDir);
     const previous = projectToolLocks.get(projectScope) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolveRelease) => { release = resolveRelease; });
@@ -64,7 +64,7 @@ export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boo
         await previous;
       }
       if (signal?.aborted) throw abortReason(signal);
-      return await runWithProjectDir(projectScope, fn);
+      return await runWithProjectDir(executionDir, () => fn(projectScope));
     } finally {
       release();
     }
@@ -76,17 +76,17 @@ export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boo
     handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
   ): unknown => {
     const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
-      ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => withProjectToolLock(
-          resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
-          ctx?.signal,
-          () => {
-            const projectDir = resolveProjectScope(resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined));
-            if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive(projectDir)) {
+      ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => {
+          const requestedCwd = typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined;
+          const executionDir = resolveExecutionProjectDir(requestedCwd);
+          const normalizedArgs = requestedCwd === undefined ? toolArgs : { ...toolArgs, cwd: executionDir };
+          return withProjectToolLock(executionDir, ctx?.signal, (projectScope) => {
+            if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive(projectScope)) {
               return { isError: true, content: [{ type: "text", text: "busy: async job is running for this project; foreground execution is temporarily disabled" }] };
             }
-            return handler(toolArgs, ctx);
-          },
-        )
+            return handler(normalizedArgs, ctx);
+          });
+        }
       : handler;
     tools.push({ name, config, handler: guardedHandler });
     return guardedHandler;
