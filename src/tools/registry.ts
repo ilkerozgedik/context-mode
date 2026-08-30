@@ -1,4 +1,4 @@
-import { resolveExecutionProjectDir, runWithProjectDir } from "../project-context.js";
+import { resolveExecutionProjectDir, resolveProjectScope, runWithProjectDir } from "../project-context.js";
 
 export interface RegisteredCtxTool {
   name: string;
@@ -22,7 +22,7 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Request cancelled");
 }
 
-export function createToolRegistry(isAsyncJobActive: () => boolean): {
+export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boolean): {
   tools: RegisteredCtxTool[];
   register: (
     name: string,
@@ -31,35 +31,42 @@ export function createToolRegistry(isAsyncJobActive: () => boolean): {
   ) => unknown;
 } {
   const tools: RegisteredCtxTool[] = [];
-  let projectToolLock: Promise<void> = Promise.resolve();
+  const projectToolLocks = new Map<string, Promise<void>>();
 
   async function withProjectToolLock<T>(
     projectDir: string,
     signal: AbortSignal | undefined,
     fn: () => Promise<T> | T,
   ): Promise<T> {
-    const previous = projectToolLock;
+    const projectScope = resolveProjectScope(projectDir);
+    const previous = projectToolLocks.get(projectScope) ?? Promise.resolve();
     let release!: () => void;
-    projectToolLock = new Promise<void>((resolve) => { release = resolve; });
-    const run = (async () => {
-      await previous;
-      try {
-        if (signal?.aborted) throw abortReason(signal);
-        return await runWithProjectDir(projectDir, fn);
-      } finally {
-        release();
-      }
-    })();
-    if (!signal) return run;
-    let rejectAbort!: (reason: Error) => void;
-    const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
-    const onAbort = () => rejectAbort(abortReason(signal));
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) onAbort();
+    const current = new Promise<void>((resolveRelease) => { release = resolveRelease; });
+    const tail = previous.then(() => current);
+    projectToolLocks.set(projectScope, tail);
+    void tail.finally(() => {
+      if (projectToolLocks.get(projectScope) === tail) projectToolLocks.delete(projectScope);
+    });
     try {
-      return await Promise.race([run, aborted]);
+      if (signal?.aborted) throw abortReason(signal);
+      if (signal) {
+        let onAbort!: () => void;
+        const aborted = new Promise<never>((_, reject) => {
+          onAbort = () => reject(abortReason(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+        try {
+          await Promise.race([previous, aborted]);
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
+      } else {
+        await previous;
+      }
+      if (signal?.aborted) throw abortReason(signal);
+      return await runWithProjectDir(projectScope, fn);
     } finally {
-      signal.removeEventListener("abort", onAbort);
+      release();
     }
   }
 
@@ -73,8 +80,9 @@ export function createToolRegistry(isAsyncJobActive: () => boolean): {
           resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
           ctx?.signal,
           () => {
-            if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive()) {
-              return { isError: true, content: [{ type: "text", text: "busy: async job is running; foreground execution is temporarily disabled" }] };
+            const projectDir = resolveProjectScope(resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined));
+            if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive(projectDir)) {
+              return { isError: true, content: [{ type: "text", text: "busy: async job is running for this project; foreground execution is temporarily disabled" }] };
             }
             return handler(toolArgs, ctx);
           },

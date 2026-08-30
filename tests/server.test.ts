@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REGISTERED_CTX_TOOLS, isDirectExecution, withProjectDirOverride } from "../src/server.js";
+import { resolveProjectScope } from "../src/project-context.js";
+import { createToolRegistry } from "../src/tools/registry.js";
 
 const EXPECTED_TOOLS = [
   "ctx_execute",
@@ -138,24 +140,25 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({}).success).toBe(false);
   });
 
-  test("foreground execution is refused while an async job is active", async () => {
-    if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync(`/run/user/${process.getuid()}/bus`)) return;
-    const start = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_start")!;
-    const status = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_status")!;
-    const cancel = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_cancel")!;
-    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
-    let jobId: string | undefined;
+  test("foreground execution is blocked only for the project with an active async job", async () => {
+    const rootA = mkdtempSync(join(tmpdir(), "context-mode-active-a-"));
+    const rootB = mkdtempSync(join(tmpdir(), "context-mode-active-b-"));
+    const activeScope = resolveProjectScope(rootA);
+    const registry = createToolRegistry((projectDir) => projectDir === activeScope);
+    const execute = registry.register("ctx_execute", {}, async () => ({
+      content: [{ type: "text", text: "other-project-ok" }],
+    })) as (args: { cwd: string }) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
     try {
-      const started = await start.handler({ command: "sleep 5", cwd: process.cwd() }) as { isError?: boolean; content: Array<{ text: string }> };
-      expect(started.isError).not.toBe(true);
-      jobId = (JSON.parse(started.content[0].text) as { job_id: string }).job_id;
-      const running = await status.handler({ job_id: jobId }) as { content: Array<{ text: string }> };
-      expect(JSON.parse(running.content[0].text).status).toBe("running");
-      const blocked = await execute.handler({ language: "shell", code: "echo should-not-run" }) as { isError?: boolean; content: Array<{ text: string }> };
+      const blocked = await execute({ cwd: rootA });
       expect(blocked.isError).toBe(true);
-      expect(blocked.content[0].text).toMatch(/async job.*running/i);
+      expect(blocked.content[0].text).toMatch(/this project/i);
+
+      const allowed = await execute({ cwd: rootB });
+      expect(allowed.isError).not.toBe(true);
+      expect(allowed.content[0].text).toContain("other-project-ok");
     } finally {
-      if (jobId) await cancel.handler({ job_id: jobId });
+      rmSync(rootA, { recursive: true, force: true });
+      rmSync(rootB, { recursive: true, force: true });
     }
   });
 
@@ -167,5 +170,7 @@ describe("context-mode tool surface", () => {
     expect(text).toContain("context-mode doctor");
     expect(text).toContain("[OK] Executor: PASS");
     expect(text).toContain("[OK] FTS5 / SQLite: PASS");
+    expect(text).toContain("job concurrency 2 global / 1 project");
+    expect(text).toContain("[OK] Async jobs: 0/2 active");
   });
 });

@@ -47,7 +47,7 @@ process.on("uncaughtException", (err) => {
 });
 
 
-const toolRegistry = createToolRegistry(() => jobManager.isActive());
+const toolRegistry = createToolRegistry((projectDir) => jobManager.isActive(projectDir));
 export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = toolRegistry.tools;
 const registerCtxTool = toolRegistry.register;
 registerExecutionTools(registerCtxTool);

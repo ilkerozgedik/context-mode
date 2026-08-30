@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
 import { getBatchConcurrencyLimit, resolveConfiguredConcurrency, REGISTERED_CTX_TOOLS } from "../src/server.js";
 import { runPool } from "../src/runPool.js";
 import { ContentStore } from "../src/store.js";
+import { createToolRegistry } from "../src/tools/registry.js";
 
 describe("resource guards", () => {
   test("cancels the spawned process tree when the request aborts", async () => {
@@ -253,38 +254,58 @@ describe("resource guards", () => {
     }
   });
 
-  test("serializes project-scoped calls across concurrent projects", async () => {
+  test("runs different project scopes concurrently", async () => {
     const rootA = mkdtempSync(join(tmpdir(), "context-mode-concurrent-a-"));
     const rootB = mkdtempSync(join(tmpdir(), "context-mode-concurrent-b-"));
-    const storage = mkdtempSync(join(tmpdir(), "context-mode-concurrent-storage-"));
-    const previousStorage = process.env.CONTEXT_MODE_DIR;
-    process.env.CONTEXT_MODE_DIR = storage;
-
-    const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute");
-    const purge = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_purge");
-    expect(batch).toBeDefined();
-    expect(purge).toBeDefined();
-
-    const run = (root: string, marker: string) => batch!.handler({
-      commands: [{ label: marker, command: `printf ${marker}` }],
-      queries: [marker],
-      timeout: 30000,
-      concurrency: 1,
-      query_scope: "batch",
-      cwd: root,
-    });
-
+    let arrivals = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const registry = createToolRegistry(() => false);
+    const run = registry.register("ctx_execute", {}, async () => {
+      arrivals += 1;
+      if (arrivals === 2) release();
+      await gate;
+      return { content: [{ type: "text", text: "ok" }] };
+    }) as (args: { cwd: string }) => Promise<unknown>;
     try {
-      const results = await Promise.all([run(rootA, "PROJECT_A_CONCURRENT"), run(rootB, "PROJECT_B_CONCURRENT")]) as Array<{ isError?: boolean }>;
-      expect(results.every((result) => result.isError !== true)).toBe(true);
+      await Promise.race([
+        Promise.all([run({ cwd: rootA }), run({ cwd: rootB })]),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("cross-project calls did not overlap")), 500)),
+      ]);
+      expect(arrivals).toBe(2);
     } finally {
-      await purge!.handler({ confirm: true, cwd: rootA });
-      await purge!.handler({ confirm: true, cwd: rootB });
-      if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
-      else process.env.CONTEXT_MODE_DIR = previousStorage;
+      release();
       rmSync(rootA, { recursive: true, force: true });
       rmSync(rootB, { recursive: true, force: true });
-      rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes calls within the same project scope", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-concurrent-same-"));
+    const child = join(root, "packages", "app");
+    mkdirSync(join(root, ".git"));
+    mkdirSync(child, { recursive: true });
+    let entries = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const registry = createToolRegistry(() => false);
+    const run = registry.register("ctx_execute", {}, async () => {
+      entries += 1;
+      if (entries === 1) await firstGate;
+      return { content: [{ type: "text", text: "ok" }] };
+    }) as (args: { cwd: string }) => Promise<unknown>;
+    try {
+      const first = run({ cwd: root });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const second = run({ cwd: child });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(entries).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(entries).toBe(2);
+    } finally {
+      releaseFirst();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -306,7 +327,7 @@ describe("resource guards", () => {
     }
   });
 
-  test("switches the active content store when the project changes", async () => {
+  test("keeps project content stores isolated during concurrent use", async () => {
     const rootA = mkdtempSync(join(tmpdir(), "context-mode-project-a-"));
     const rootB = mkdtempSync(join(tmpdir(), "context-mode-project-b-"));
     const storage = mkdtempSync(join(tmpdir(), "context-mode-storage-"));
@@ -321,11 +342,15 @@ describe("resource guards", () => {
     expect(purge).toBeDefined();
 
     try {
-      await index!.handler({ content: "PROJECT_A_ONLY", source: "project-a", cwd: rootA });
-      await index!.handler({ content: "PROJECT_B_ONLY", source: "project-b", cwd: rootB });
+      await Promise.all([
+        index!.handler({ content: "PROJECT_A_ONLY", source: "project-a", cwd: rootA }),
+        index!.handler({ content: "PROJECT_B_ONLY", source: "project-b", cwd: rootB }),
+      ]);
 
-      const fromB = await search!.handler({ queries: ["PROJECT_A_ONLY"], cwd: rootB }) as { content: Array<{ text: string }> };
-      const fromA = await search!.handler({ queries: ["PROJECT_A_ONLY"], cwd: rootA }) as { content: Array<{ text: string }> };
+      const [fromB, fromA] = await Promise.all([
+        search!.handler({ queries: ["PROJECT_A_ONLY"], cwd: rootB }),
+        search!.handler({ queries: ["PROJECT_A_ONLY"], cwd: rootA }),
+      ]) as Array<{ content: Array<{ text: string }> }>;
 
       expect(fromB.content[0]?.text).not.toContain("--- [project-a");
       expect(fromA.content[0]?.text).toContain("--- [project-a");

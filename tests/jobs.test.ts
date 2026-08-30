@@ -62,32 +62,37 @@ describe("async jobs", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-  test("admits only one active job and exposes a receipt after completion", async () => {
+  test("admits two projects, limits one job per project, and enforces global capacity", async () => {
     const runner = new FakeRunner();
-    const manager = new JobManager({ runner, maxCompleted: 4, ttlMs: 60_000 });
-    const root = mkdtempSync(join(tmpdir(), "context-mode-job-"));
+    const manager = new JobManager({ runner, maxCompleted: 4, ttlMs: 60_000, maxActive: 2, maxActivePerProject: 1 });
+    const rootA = mkdtempSync(join(tmpdir(), "context-mode-job-a-"));
+    const rootB = mkdtempSync(join(tmpdir(), "context-mode-job-b-"));
+    const rootC = mkdtempSync(join(tmpdir(), "context-mode-job-c-"));
     try {
-      const artifact = join(root, "app.apk");
-      const first = manager.start({ command: "build", cwd: root, expectedArtifacts: ["app.apk"] });
-      expect(() => manager.start({ command: "second", cwd: root })).toThrow(/busy/i);
-      writeFileSync(artifact, "apk");
-      runner.completions[0]({ exitCode: 0, stdoutTail: "ok", stderrTail: "" });
-      await first.done;
+      const artifact = join(rootA, "app.apk");
+      const first = manager.start({ command: "build-a", cwd: rootA, expectedArtifacts: ["app.apk"] });
+      const second = manager.start({ command: "build-b", cwd: rootB });
+      expect(manager.activeCount()).toBe(2);
+      expect(manager.isActive(rootA)).toBe(true);
+      expect(manager.isActive(rootB)).toBe(true);
+      expect(manager.isActive(rootC)).toBe(false);
+      expect(() => manager.start({ command: "same-project", cwd: rootA })).toThrow(/this project/i);
+      expect(() => manager.start({ command: "third-project", cwd: rootC })).toThrow(/capacity/i);
 
+      writeFileSync(artifact, "apk");
+      runner.completions[0]({ exitCode: 0, stdoutTail: "ok-a", stderrTail: "" });
+      runner.completions[1]({ exitCode: 0, stdoutTail: "ok-b", stderrTail: "" });
+      await Promise.all([first.done, second.done]);
+
+      expect(manager.activeCount()).toBe(0);
       const status = manager.status(first.jobId);
       expect(status.status).toBe("succeeded");
-      expect(status.exit_code).toBe(0);
-      expect(status.stdout_tail).toBe("ok");
-      expect(status.artifacts).toEqual([
-        expect.objectContaining({ path: artifact, size: 3 }),
-      ]);
-
-      const next = manager.start({ command: "next", cwd: root });
-      runner.completions[1]({ exitCode: 1, stdoutTail: "", stderrTail: "failed" });
-      await next.done;
-      expect(manager.status(next.jobId).status).toBe("failed");
+      expect(status.stdout_tail).toBe("ok-a");
+      expect(status.artifacts).toEqual([expect.objectContaining({ path: artifact, size: 3 })]);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(rootA, { recursive: true, force: true });
+      rmSync(rootB, { recursive: true, force: true });
+      rmSync(rootC, { recursive: true, force: true });
     }
   });
 

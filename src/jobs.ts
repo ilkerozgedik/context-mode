@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve, sep } from "node:path";
+import { resolveProjectScope } from "./project-context.js";
 
 export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
 
@@ -23,7 +24,6 @@ export interface JobHandle {
 
 export interface JobRunner {
   reconcile?(): void;
-  hasActiveJobs?(): boolean;
   start(opts: { unit: string; cwd: string; command: string }): JobHandle;
 }
 
@@ -47,6 +47,7 @@ export interface JobReceipt {
 
 interface JobRecord {
   id: string;
+  projectScope: string;
   status: JobStatus;
   exitCode: number | null;
   startedAt: string;
@@ -144,11 +145,6 @@ export class SystemdJobRunner implements JobRunner {
       this.#resetFailedUnit(unit);
       console.error(`[context-mode] reconciled stale job unit=${unit}`);
     }
-  }
-
-  hasActiveJobs(): boolean {
-    return this.#listJobUnits().some(({ activeState }) =>
-      ["active", "activating", "deactivating"].includes(activeState));
   }
 
   #listJobUnits(): Array<{ unit: string; activeState: string }> {
@@ -304,37 +300,63 @@ export function classifyJobTermination(
 export class JobManager {
   readonly #runner: JobRunner;
   readonly #jobs = new Map<string, JobRecord>();
+  readonly #activeIds = new Set<string>();
   readonly #maxCompleted: number;
   readonly #ttlMs: number;
-  #activeId: string | null = null;
+  readonly #maxActive: number;
+  readonly #maxActivePerProject: number;
 
-  constructor(opts?: { runner?: JobRunner; maxCompleted?: number; ttlMs?: number }) {
+  constructor(opts?: {
+    runner?: JobRunner;
+    maxCompleted?: number;
+    ttlMs?: number;
+    maxActive?: number;
+    maxActivePerProject?: number;
+  }) {
     this.#runner = opts?.runner ?? new SystemdJobRunner();
     this.#maxCompleted = opts?.maxCompleted ?? 32;
     this.#ttlMs = opts?.ttlMs ?? 60 * 60 * 1000;
+    this.#maxActive = opts?.maxActive ?? positiveInt(process.env.CONTEXT_MODE_MAX_ASYNC_JOBS, 2);
+    this.#maxActivePerProject = opts?.maxActivePerProject ?? positiveInt(process.env.CONTEXT_MODE_MAX_ASYNC_JOBS_PER_PROJECT, 1);
     this.#runner.reconcile?.();
   }
 
-  isActive(): boolean {
-    return this.#activeId !== null;
+  isActive(projectDir?: string): boolean {
+    if (!projectDir) return this.#activeIds.size > 0;
+    const projectScope = resolveProjectScope(projectDir);
+    return [...this.#activeIds].some((id) => this.#jobs.get(id)?.projectScope === projectScope);
+  }
+
+  activeCount(): number {
+    return this.#activeIds.size;
+  }
+
+  concurrencyLimits(): { global: number; perProject: number } {
+    return { global: this.#maxActive, perProject: this.#maxActivePerProject };
   }
 
   start(opts: { command: string; cwd: string; expectedArtifacts?: string[] }): { jobId: string; done: Promise<void> } {
     this.#prune();
-    if (!this.#activeId) this.#runner.reconcile?.();
-    if (this.#activeId || this.#runner.hasActiveJobs?.()) {
-      console.error(`[context-mode] job busy active=${this.#activeId}`);
-      throw new Error("busy: another async job is running");
-    }
     const cwd = resolve(opts.cwd);
     const cwdStat = statSync(cwd);
     if (!cwdStat.isDirectory()) throw new Error(`job cwd is not a directory: ${cwd}`);
+    const projectScope = resolveProjectScope(cwd);
+    const projectActive = [...this.#activeIds].filter((id) => this.#jobs.get(id)?.projectScope === projectScope).length;
+    if (projectActive >= this.#maxActivePerProject) {
+      console.error(`[context-mode] job busy project=${projectScope} active=${projectActive}`);
+      throw new Error("busy: async job is already running for this project");
+    }
+    if (this.#activeIds.size >= this.#maxActive) {
+      console.error(`[context-mode] job capacity active=${this.#activeIds.size} max=${this.#maxActive}`);
+      throw new Error("busy: async job capacity reached");
+    }
     const expectedArtifacts = (opts.expectedArtifacts ?? []).map((path) => this.#resolveArtifact(cwd, path));
     const id = randomUUID();
     const unit = `context-mode-job-${process.pid}-${id.replace(/-/g, "")}`;
     const handle = this.#runner.start({ unit, cwd, command: opts.command });
     const record: JobRecord = {
       id,
+      projectScope,
       status: "running",
       exitCode: null,
       startedAt: new Date().toISOString(),
@@ -347,9 +369,9 @@ export class JobManager {
       done: Promise.resolve(),
       cancelRequested: false,
     };
-    this.#activeId = id;
+    this.#activeIds.add(id);
     this.#jobs.set(id, record);
-    console.error(`[context-mode] job started id=${id} unit=${unit}`);
+    console.error(`[context-mode] job started id=${id} unit=${unit} project=${projectScope}`);
     record.done = handle.done.then((completion) => {
       record.exitCode = completion.exitCode;
       record.stdoutTail = completion.stdoutTail;
@@ -358,8 +380,8 @@ export class JobManager {
       const classified = classifyJobTermination(completion, record.cancelRequested);
       record.status = classified.status;
       record.terminationReason = classified.reason;
-      if (this.#activeId === id) this.#activeId = null;
-      console.error(`[context-mode] job finished id=${id} status=${record.status} reason=${record.terminationReason}`);
+      this.#activeIds.delete(id);
+      console.error(`[context-mode] job finished id=${id} status=${record.status} reason=${record.terminationReason} project=${projectScope}`);
       this.#prune();
     });
     return { jobId: id, done: record.done };
@@ -384,11 +406,12 @@ export class JobManager {
   }
 
   cleanup(): void {
-    if (!this.#activeId) return;
-    const record = this.#jobs.get(this.#activeId);
-    if (!record || record.status !== "running") return;
-    record.cancelRequested = true;
-    void record.handle.cancel();
+    for (const id of this.#activeIds) {
+      const record = this.#jobs.get(id);
+      if (!record || record.status !== "running") continue;
+      record.cancelRequested = true;
+      void record.handle.cancel();
+    }
   }
 
   #resolveArtifact(cwd: string, artifact: string): string {

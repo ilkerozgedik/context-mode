@@ -1,11 +1,11 @@
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { available, runtimes } from "../app-runtime.js";
+import { available, jobManager, runtimes } from "../app-runtime.js";
 import { getBatchConcurrencyLimit } from "../batch.js";
 import { loadDatabase } from "../db-base.js";
 import { PolyglotExecutor, configuredExecutionAdmissionError } from "../executor.js";
-import { closeStore, getContentDir, getProjectDir, projectHash } from "../project-context.js";
+import { closeProjectStore, getContentDir, getProjectDir, projectHash } from "../project-context.js";
 
 type RegisterTool = (
   name: string,
@@ -28,7 +28,9 @@ export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: 
       lines.push(`[OK] Runtimes: ${available.length} — ${available.join(", ")}`);
       const admission = configuredExecutionAdmissionError();
       lines.push(admission ? `[WARN] Admission: ${admission}` : "[OK] Admission: ready");
-      lines.push(`[OK] Limits: min available ${process.env.CONTEXT_MODE_MIN_AVAILABLE_MB ?? "disabled"} MiB; job min available ${process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB ?? "disabled"} MiB; foreground ${process.env.CONTEXT_MODE_MAX_FOREGROUND_MS ?? "unlimited"} ms; batch concurrency ${getBatchConcurrencyLimit()}`);
+      const jobLimits = jobManager.concurrencyLimits();
+      lines.push(`[OK] Limits: min available ${process.env.CONTEXT_MODE_MIN_AVAILABLE_MB ?? "disabled"} MiB; job min available ${process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB ?? "disabled"} MiB; foreground ${process.env.CONTEXT_MODE_MAX_FOREGROUND_MS ?? "unlimited"} ms; batch concurrency ${getBatchConcurrencyLimit()}; job concurrency ${jobLimits.global} global / ${jobLimits.perProject} project`);
+      lines.push(`[OK] Async jobs: ${jobManager.activeCount()}/${jobLimits.global} active`);
 
       try {
         lines.push(`[OK] Storage content: ${getContentDir()}`);
@@ -97,7 +99,7 @@ export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: 
         return { content: [{ type: "text" as const, text: "Purge cancelled. Pass confirm: true to proceed." }] };
       }
 
-      closeStore();
+      closeProjectStore();
 
       try {
         const projectDir = getProjectDir();
