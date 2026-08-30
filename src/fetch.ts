@@ -33,7 +33,7 @@ export async function readResponseTextWithLimit(
       if (done) break;
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
-        await reader.cancel();
+        try { await reader.cancel(); } catch { /* preserve the size-limit error */ }
         throw new Error(`Response too large: ${totalBytes} bytes exceeds ${maxBytes}`);
       }
       chunks.push(decoder.decode(value, { stream: true }));
