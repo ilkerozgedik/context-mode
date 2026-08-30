@@ -763,7 +763,7 @@ registerCtxTool(
         .boolean()
         .optional()
         .default(false)
-        .describe("Keep the process running after timeout for servers or daemons."),
+        .describe("Deprecated compatibility flag. true is rejected; use ctx_job_start for long-running work."),
       cwd: z
         .string()
         .optional()
@@ -776,6 +776,12 @@ registerCtxTool(
   },
   async ({ language, code, timeout, background, cwd, intent }, ctx) => {
     try {
+      if (background) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "background execution was removed; use ctx_job_start for long-running work" }],
+        };
+      }
       // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
       if (language === "javascript") {
@@ -840,10 +846,10 @@ if(__cm_req.cache)require.cache=__cm_req.cache;}
 async function __cm_main(){
 ${code}
 }
-__cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
+__cm_main().catch(e=>{console.error(e);process.exitCode=1});
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: timeout, background, cwd, signal: ctx?.signal });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout, cwd, signal: ctx?.signal });
 
       // Echo the executed source code before stdout so users can audit
       // and host approval UIs can audit the exact payload (Issues #717 + #736).
@@ -865,17 +871,6 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       if (result.timedOut) {
         const partialOutput = result.stdout?.trim();
-        if (result.backgrounded && partialOutput) {
-          // Background mode: process is still running, return partial output as success
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${result.timeoutMs ?? timeout ?? "unknown"}ms — still running)_`,
-              },
-            ],
-          };
-        }
         if (partialOutput) {
           // Timeout with partial output — return as success with note
           return {
@@ -2585,7 +2580,7 @@ registerCtxTool(
     } catch (err) {
       lines.push(`[FAIL] Executor: ${err instanceof Error ? err.message : err}`);
     } finally {
-      testExecutor.cleanupBackgrounded();
+      testExecutor.cleanupProcesses();
     }
 
     let testDb: any;
@@ -2779,7 +2774,7 @@ async function writeJsonRpcHttpError(res: ServerResponse, status: number, code: 
 
 function cleanupRuntime(): void {
   jobManager.cleanup();
-  executor.cleanupBackgrounded();
+  executor.cleanupProcesses();
   if (_store) {
     try { _store.close(); } catch {}
     _store = null;

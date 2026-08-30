@@ -30,19 +30,10 @@ export function memoryAdmissionError(meminfo: string, minAvailableMb: number): s
 
 export function resolveForegroundTimeout(
   timeout: number | undefined,
-  background: boolean,
   maxForegroundMs: number,
 ): number | undefined {
-  if (background || maxForegroundMs <= 0) return timeout;
+  if (maxForegroundMs <= 0) return timeout;
   return timeout === undefined ? maxForegroundMs : Math.min(timeout, maxForegroundMs);
-}
-
-export function resolveBackgroundDetachTimeout(
-  timeout: number | undefined,
-  maxDetachMs: number,
-): number | undefined {
-  if (maxDetachMs <= 0) return timeout;
-  return timeout === undefined ? maxDetachMs : Math.min(timeout, maxDetachMs);
 }
 
 function configuredMemoryAdmissionError(envName: string): string | undefined {
@@ -243,8 +234,6 @@ interface ExecuteOptions {
   language: Language;
   code: string;
   timeout?: number;
-  /** Keep process running after timeout instead of killing it. */
-  background?: boolean;
   /**
    * Issue #45 — per-call cwd override for the shell language. When set,
    * the shell script runs in this directory instead of `#projectRoot`.
@@ -303,7 +292,7 @@ export class PolyglotExecutor {
   }
 
   /** Kill all active process groups during server shutdown. */
-  cleanupBackgrounded(): void {
+  cleanupProcesses(): void {
     for (const pid of this.#activePids) {
       killTree({ pid });
     }
@@ -311,12 +300,10 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
+    const { language, code, timeout, cwd: cwdOverride, signal } = opts;
     const admissionError = configuredExecutionAdmissionError();
     if (admissionError) throw new Error(admissionError);
-    const effectiveTimeout = background
-      ? resolveBackgroundDetachTimeout(timeout, readNonNegativeEnv("CONTEXT_MODE_MAX_BACKGROUND_DETACH_MS"))
-      : resolveForegroundTimeout(timeout, false, readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"));
+    const effectiveTimeout = resolveForegroundTimeout(timeout, readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"));
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -335,13 +322,8 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, background, signal);
-
-      // Skip tmpDir cleanup if process was backgrounded — it may still need files
-      if (!result.backgrounded) {
-        cleanupTmpDir(tmpDir);
-      }
-
+      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, signal);
+      cleanupTmpDir(tmpDir);
       return result;
     } catch (err) {
       cleanupTmpDir(tmpDir);
@@ -391,7 +373,6 @@ export class PolyglotExecutor {
     cwd: string,
     sandboxTmpDir: string,
     timeout: number | undefined,
-    background = false,
     signal?: AbortSignal,
   ): Promise<ExecResult> {
     return new Promise((res) => {
@@ -413,13 +394,11 @@ export class PolyglotExecutor {
       // Use `exit`, not `close`: background children can keep stdio pipes open,
       // delaying `close` until after the leaked work has already run.
       proc.once("exit", () => {
-        if (!background) killTree(proc);
+        killTree(proc);
       });
 
       let timedOut = false;
-      let resolved = false;
       const abortExecution = () => {
-        if (resolved) return;
         killTree(proc);
       };
       if (signal?.aborted) abortExecution();
@@ -431,40 +410,7 @@ export class PolyglotExecutor {
       // false negatives whenever the caller forgot the explicit value.
       const timer: NodeJS.Timeout | undefined = timeout === undefined ? undefined : setTimeout(() => {
         timedOut = true;
-        if (background) {
-          // Background mode: detach process, return partial output, keep running
-          resolved = true;
-          proc.unref();
-          // Do NOT destroy stdout/stderr — closing the read end of the pipe
-          // sends SIGPIPE to the child on its next write, killing it.
-          // Instead, replace the data listeners with no-op drains that
-          // consume the stream without accumulating buffers. This keeps
-          // the pipe open and prevents the child from blocking on a full
-          // pipe buffer.
-          if (proc.stdout) {
-            proc.stdout.removeAllListeners("data");
-            proc.stdout.on("data", () => {});
-          }
-          if (proc.stderr) {
-            proc.stderr.removeAllListeners("data");
-            proc.stderr.on("data", () => {});
-          }
-          const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
-          let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
-          if (capExceeded) {
-            rawStderr += `\n[output capped at ${(this.#hardCapBytes / 1024 / 1024).toFixed(0)}MB — excess output discarded]`;
-          }
-          res({
-            stdout: rawStdout,
-            stderr: rawStderr,
-            exitCode: 0,
-            timedOut: true,
-            timeoutMs: timeout,
-            backgrounded: true,
-          });
-        } else {
-          killTree(proc);
-        }
+        killTree(proc);
       }, timeout);
 
       // Stream-level capture cap: retain at most hardCapBytes across stdout+stderr
@@ -490,12 +436,9 @@ export class PolyglotExecutor {
       proc.on("close", (exitCode) => {
         signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
-        if (!background) {
-          // Foreground calls must not leak descendants when user code backgrounds a command.
-          killTree(proc);
-        }
+        // Foreground calls must not leak descendants when user code backgrounds a command.
+        killTree(proc);
         if (proc.pid) this.#activePids.delete(proc.pid);
-        if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
 
@@ -519,7 +462,6 @@ export class PolyglotExecutor {
         signal?.removeEventListener("abort", abortExecution);
         clearTimeout(timer);
         if (proc.pid) this.#activePids.delete(proc.pid);
-        if (resolved) return; // Already resolved by background timeout
         res({
           stdout: "",
           stderr: err.message,

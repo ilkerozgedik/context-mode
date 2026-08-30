@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   JobManager,
+  SystemdJobRunner,
   buildSystemdRunArgs,
+  classifyJobTermination,
   type JobCompletion,
   type JobHandle,
   type JobRunner,
@@ -108,6 +110,60 @@ describe("async jobs", () => {
     }
   });
 
+  test("classifies systemd termination reasons without losing cancellation precedence", async () => {
+    const cases = [
+      [{ exitCode: 1, systemdResult: "oom-kill", execMainStatus: 9 }, "oom-kill"],
+      [{ exitCode: 1, systemdResult: "timeout", execMainStatus: 9 }, "runtime-timeout"],
+      [{ exitCode: 1, systemdResult: "signal", execMainStatus: 15 }, "signal:15"],
+      [{ exitCode: 7, systemdResult: "exit-code", execMainStatus: 7 }, "exit:7"],
+    ] as const;
+    for (const [completion, expected] of cases) {
+      const runner = new FakeRunner();
+      const manager = new JobManager({ runner });
+      const root = mkdtempSync(join(tmpdir(), "context-mode-job-reason-"));
+      try {
+        const started = manager.start({ command: "fail", cwd: root });
+        runner.completions[0]({ ...completion, stdoutTail: "", stderrTail: "" } as JobCompletion);
+        await started.done;
+        expect(manager.status(started.jobId).termination_reason).toBe(expected);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const runner = new FakeRunner();
+    const manager = new JobManager({ runner });
+    const root = mkdtempSync(join(tmpdir(), "context-mode-job-cancel-reason-"));
+    try {
+      const started = manager.start({ command: "sleep", cwd: root });
+      const cancelled = manager.cancel(started.jobId);
+      runner.completions[0]({ exitCode: 1, systemdResult: "signal", execMainStatus: 15, stdoutTail: "", stderrTail: "" } as JobCompletion);
+      await cancelled;
+      expect(manager.status(started.jobId).termination_reason).toBe("cancelled");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reads RuntimeMaxSec from systemd as runtime-timeout", async () => {
+    if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync(`/run/user/${process.getuid()}/bus`)) return;
+    const previous = process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC;
+    process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC = "1";
+    try {
+      const runner = new SystemdJobRunner();
+      const completion = await runner.start({
+        unit: `context-mode-test-timeout-${process.pid}`,
+        cwd: process.cwd(),
+        command: "sleep 5",
+      }).done;
+      expect(completion.systemdResult).toBe("timeout");
+      expect(classifyJobTermination(completion, false)).toEqual({ status: "failed", reason: "runtime-timeout" });
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC;
+      else process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC = previous;
+    }
+  });
+
   test("builds a bounded native systemd user service command", () => {
     const args = buildSystemdRunArgs({
       unit: "context-mode-job-abc",
@@ -133,7 +189,7 @@ describe("async jobs", () => {
     expect(args).toContain("--setenv=LANG=en_US.UTF-8");
     expect(args).toContain("--setenv=NO_COLOR=1");
     expect(args).toContain("--pipe");
-    expect(args).toContain("--collect");
+    expect(args).not.toContain("--collect");
     expect(args.slice(-3)).toEqual(["/bin/bash", "-c", "godot --headless --export-debug Android app.apk"]);
   });
 });

@@ -4,7 +4,6 @@ export interface ExecResult {
   exitCode: number;
   timedOut: boolean;
   timeoutMs?: number;
-  backgrounded?: boolean;
 }
 
 export interface IndexResult {

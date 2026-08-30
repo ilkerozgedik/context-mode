@@ -124,6 +124,15 @@ describe("context-mode tool surface", () => {
     }));
   });
 
+  test("ctx_execute rejects legacy background detach and points callers to ctx_job_start", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+    const result = await execute.handler({ language: "shell", code: "echo should-not-run", background: true }) as {
+      isError?: boolean; content: Array<{ text: string }>;
+    };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/background.*removed.*ctx_job_start/i);
+  });
+
   test("foreground execution is refused while an async job is active", async () => {
     if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync(`/run/user/${process.getuid()}/bus`)) return;
     const start = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_start")!;

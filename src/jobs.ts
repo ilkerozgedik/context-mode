@@ -8,6 +8,9 @@ export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
 export interface JobCompletion {
   exitCode: number | null;
   signal?: NodeJS.Signals | null;
+  systemdResult?: string;
+  execMainCode?: number;
+  execMainStatus?: number;
   stdoutTail: string;
   stderrTail: string;
 }
@@ -99,7 +102,6 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
   return [
     "--user",
     `--unit=${opts.unit}`,
-    "--collect",
     "--pipe",
     "--wait",
     "--service-type=exec",
@@ -134,20 +136,22 @@ export class SystemdJobRunner implements JobRunner {
   readonly #tailBytes = positiveInt(process.env.CONTEXT_MODE_JOB_LOG_TAIL_BYTES, 64 * 1024);
 
   reconcile(): void {
-    for (const unit of this.#listJobUnits()) {
+    for (const { unit } of this.#listJobUnits()) {
       const match = unit.match(/^context-mode-job-(\d+)-[0-9a-f]+\.service$/);
       const ownerPid = match ? Number(match[1]) : null;
       if (ownerPid !== null && this.#processExists(ownerPid)) continue;
       this.#stopUnit(unit);
+      this.#resetFailedUnit(unit);
       console.error(`[context-mode] reconciled stale job unit=${unit}`);
     }
   }
 
   hasActiveJobs(): boolean {
-    return this.#listJobUnits().length > 0;
+    return this.#listJobUnits().some(({ activeState }) =>
+      ["active", "activating", "deactivating"].includes(activeState));
   }
 
-  #listJobUnits(): string[] {
+  #listJobUnits(): Array<{ unit: string; activeState: string }> {
     if (process.platform !== "linux" || !existsSync("/usr/bin/systemctl")) return [];
     try {
       const output = execFileSync(
@@ -157,9 +161,8 @@ export class SystemdJobRunner implements JobRunner {
       );
       return output.split(/\r?\n/)
         .map((line) => line.trim().split(/\s+/))
-        .filter((parts) => ["active", "activating", "deactivating"].includes(parts[2] ?? ""))
-        .map((parts) => parts[0])
-        .filter((unit) => unit?.startsWith("context-mode-job-") && unit.endsWith(".service"));
+        .filter((parts) => parts[0]?.startsWith("context-mode-job-") && parts[0].endsWith(".service"))
+        .map((parts) => ({ unit: parts[0], activeState: parts[2] ?? "unknown" }));
     } catch {
       return [];
     }
@@ -175,6 +178,41 @@ export class SystemdJobRunner implements JobRunner {
         env: systemdUserEnv(), stdio: "ignore", timeout: 10_000,
       });
     } catch { /* best effort; runtime cap remains the final guard */ }
+  }
+
+  #resetFailedUnit(unit: string, env = systemdUserEnv()): void {
+    try {
+      execFileSync("/usr/bin/systemctl", ["--user", "reset-failed", unit], {
+        env, stdio: "ignore", timeout: 10_000,
+      });
+    } catch { /* unit may already be unloaded */ }
+  }
+
+  #readCompletionMetadata(unit: string, env: NodeJS.ProcessEnv): Pick<JobCompletion, "systemdResult" | "execMainCode" | "execMainStatus"> {
+    try {
+      const output = execFileSync(
+        "/usr/bin/systemctl",
+        ["--user", "show", `${unit}.service`, "--property=Result", "--property=ExecMainCode", "--property=ExecMainStatus"],
+        { env, encoding: "utf8", timeout: 10_000 },
+      );
+      const values = new Map(output.split(/\r?\n/).filter(Boolean).map((line) => {
+        const i = line.indexOf("=");
+        return i < 0 ? [line, ""] : [line.slice(0, i), line.slice(i + 1)];
+      }));
+      const numberValue = (key: string): number | undefined => {
+        const raw = values.get(key);
+        if (raw === undefined || raw === "") return undefined;
+        const value = Number(raw);
+        return Number.isInteger(value) ? value : undefined;
+      };
+      return {
+        systemdResult: values.get("Result") || undefined,
+        execMainCode: numberValue("ExecMainCode"),
+        execMainStatus: numberValue("ExecMainStatus"),
+      };
+    } catch {
+      return {};
+    }
   }
 
   start(opts: { unit: string; cwd: string; command: string }): JobHandle {
@@ -208,9 +246,12 @@ export class SystemdJobRunner implements JobRunner {
         resolveDone({ exitCode: null, stdoutTail: stdout.toString("utf8"), stderrTail: `${stderr.toString("utf8")}${error.message}` });
       });
       proc.once("close", (exitCode, signal) => {
+        const metadata = this.#readCompletionMetadata(opts.unit, env);
+        this.#resetFailedUnit(`${opts.unit}.service`, env);
         resolveDone({
           exitCode,
           signal,
+          ...metadata,
           stdoutTail: stdout.toString("utf8"),
           stderrTail: stderr.toString("utf8"),
         });
@@ -238,6 +279,26 @@ export class SystemdJobRunner implements JobRunner {
 function killClient(proc: ChildProcess): void {
   if (!proc.pid) return;
   try { process.kill(-proc.pid, "SIGKILL"); } catch { /* already gone */ }
+}
+
+export function classifyJobTermination(
+  completion: JobCompletion,
+  cancelRequested: boolean,
+): { status: JobStatus; reason: string } {
+  if (cancelRequested) return { status: "cancelled", reason: "cancelled" };
+  if (completion.systemdResult === "oom-kill") return { status: "failed", reason: "oom-kill" };
+  if (completion.systemdResult === "timeout") return { status: "failed", reason: "runtime-timeout" };
+  if (completion.systemdResult === "signal" || completion.systemdResult === "core-dump") {
+    const signal = completion.execMainStatus ?? completion.signal ?? "unknown";
+    return { status: "failed", reason: `signal:${signal}` };
+  }
+  if (completion.systemdResult === "exit-code") {
+    const code = completion.execMainStatus ?? completion.exitCode ?? "unknown";
+    return { status: "failed", reason: `exit:${code}` };
+  }
+  if (completion.exitCode === 0) return { status: "succeeded", reason: "exit:0" };
+  if (completion.signal) return { status: "failed", reason: `signal:${completion.signal}` };
+  return { status: "failed", reason: `exit:${completion.exitCode ?? "unknown"}` };
 }
 
 export class JobManager {
@@ -294,16 +355,9 @@ export class JobManager {
       record.stdoutTail = completion.stdoutTail;
       record.stderrTail = completion.stderrTail;
       record.finishedAt = new Date().toISOString();
-      if (record.cancelRequested) {
-        record.status = "cancelled";
-        record.terminationReason = "cancelled";
-      } else if (completion.exitCode === 0) {
-        record.status = "succeeded";
-        record.terminationReason = "exit:0";
-      } else {
-        record.status = "failed";
-        record.terminationReason = completion.signal ? `signal:${completion.signal}` : `exit:${completion.exitCode ?? "unknown"}`;
-      }
+      const classified = classifyJobTermination(completion, record.cancelRequested);
+      record.status = classified.status;
+      record.terminationReason = classified.reason;
       if (this.#activeId === id) this.#activeId = null;
       console.error(`[context-mode] job finished id=${id} status=${record.status} reason=${record.terminationReason}`);
       this.#prune();

@@ -6,7 +6,6 @@ import {
   PolyglotExecutor,
   configuredJobAdmissionError,
   memoryAdmissionError,
-  resolveBackgroundDetachTimeout,
   resolveForegroundTimeout,
 } from "../src/executor.js";
 import { getBatchConcurrencyLimit, resolveConfiguredConcurrency, REGISTERED_CTX_TOOLS } from "../src/server.js";
@@ -31,7 +30,7 @@ describe("resource guards", () => {
       expect(existsSync(marker)).toBe(false);
     } finally {
       rmSync(marker, { force: true });
-      executor.cleanupBackgrounded();
+      executor.cleanupProcesses();
     }
   });
 
@@ -45,13 +44,13 @@ describe("resource guards", () => {
         timeout: 5000,
       });
       await new Promise((resolve) => setTimeout(resolve, 30));
-      executor.cleanupBackgrounded();
+      executor.cleanupProcesses();
       await run;
       await new Promise((resolve) => setTimeout(resolve, 350));
       expect(existsSync(marker)).toBe(false);
     } finally {
       rmSync(marker, { force: true });
-      executor.cleanupBackgrounded();
+      executor.cleanupProcesses();
     }
   });
 
@@ -100,13 +99,9 @@ describe("resource guards", () => {
       .toContain("512 MiB available");
     expect(memoryAdmissionError("MemAvailable: 1048576 kB\n", 768)).toBeUndefined();
     expect(memoryAdmissionError("MemAvailable: 1 kB\n", 0)).toBeUndefined();
-    expect(resolveForegroundTimeout(undefined, false, 45_000)).toBe(45_000);
-    expect(resolveForegroundTimeout(90_000, false, 45_000)).toBe(45_000);
-    expect(resolveForegroundTimeout(10_000, false, 45_000)).toBe(10_000);
-    expect(resolveForegroundTimeout(undefined, true, 45_000)).toBeUndefined();
-    expect(resolveBackgroundDetachTimeout(undefined, 5_000)).toBe(5_000);
-    expect(resolveBackgroundDetachTimeout(30_000, 5_000)).toBe(5_000);
-    expect(resolveBackgroundDetachTimeout(2_000, 5_000)).toBe(2_000);
+    expect(resolveForegroundTimeout(undefined, 45_000)).toBe(45_000);
+    expect(resolveForegroundTimeout(90_000, 45_000)).toBe(45_000);
+    expect(resolveForegroundTimeout(10_000, 45_000)).toBe(10_000);
     const previousConcurrency = process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
     try {
       process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = "2";

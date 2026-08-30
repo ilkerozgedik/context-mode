@@ -40,7 +40,7 @@ describe("runtime and executor", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe("core-smoke");
     } finally {
-      executor.cleanupBackgrounded();
+      executor.cleanupProcesses();
     }
   });
 });
