@@ -294,7 +294,7 @@ describe("resource guards", () => {
       ctx_execute_file: { path: "README.md", language: "javascript", code: "console.log(FILE_CONTENT.length)", cwd: root },
       ctx_index: { content: "schema marker", cwd: root },
       ctx_search: { queries: ["schema marker"], cwd: root },
-      ctx_fetch_and_index: { url: "https://example.com", cwd: root },
+      ctx_fetch_and_index: { requests: [{ url: "https://example.com" }], cwd: root },
       ctx_purge: { confirm: false, cwd: root },
     };
 
