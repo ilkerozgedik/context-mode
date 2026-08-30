@@ -14,10 +14,13 @@ export interface JobCompletion {
 
 export interface JobHandle {
   done: Promise<JobCompletion>;
+  snapshot?(): Pick<JobCompletion, "stdoutTail" | "stderrTail">;
   cancel(): Promise<void>;
 }
 
 export interface JobRunner {
+  reconcile?(): void;
+  hasActiveJobs?(): boolean;
   start(opts: { unit: string; cwd: string; command: string }): JobHandle;
 }
 
@@ -109,10 +112,14 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
     `--property=CPUQuota=${opts.cpuQuotaPercent}%`,
     `--property=RuntimeMaxSec=${opts.runtimeMaxSec}s`,
     "--property=OOMPolicy=stop",
+    "--property=NoNewPrivileges=yes",
+    "--property=UMask=0077",
     `--setenv=PATH=${opts.path}`,
     `--setenv=HOME=${opts.home}`,
+    "--setenv=LANG=en_US.UTF-8",
+    "--setenv=NO_COLOR=1",
     "/bin/bash",
-    "-lc",
+    "-c",
     opts.command,
   ];
 }
@@ -125,6 +132,50 @@ export class SystemdJobRunner implements JobRunner {
   readonly #cpuQuotaPercent = positiveInt(process.env.CONTEXT_MODE_JOB_CPU_QUOTA_PERCENT, 200);
   readonly #runtimeMaxSec = positiveInt(process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC, 3600);
   readonly #tailBytes = positiveInt(process.env.CONTEXT_MODE_JOB_LOG_TAIL_BYTES, 64 * 1024);
+
+  reconcile(): void {
+    for (const unit of this.#listJobUnits()) {
+      const match = unit.match(/^context-mode-job-(\d+)-[0-9a-f]+\.service$/);
+      const ownerPid = match ? Number(match[1]) : null;
+      if (ownerPid !== null && this.#processExists(ownerPid)) continue;
+      this.#stopUnit(unit);
+      console.error(`[context-mode] reconciled stale job unit=${unit}`);
+    }
+  }
+
+  hasActiveJobs(): boolean {
+    return this.#listJobUnits().length > 0;
+  }
+
+  #listJobUnits(): string[] {
+    if (process.platform !== "linux" || !existsSync("/usr/bin/systemctl")) return [];
+    try {
+      const output = execFileSync(
+        "/usr/bin/systemctl",
+        ["--user", "list-units", "--all", "--plain", "--no-legend", "context-mode-job-*.service"],
+        { env: systemdUserEnv(), encoding: "utf8", timeout: 10_000 },
+      );
+      return output.split(/\r?\n/)
+        .map((line) => line.trim().split(/\s+/))
+        .filter((parts) => ["active", "activating", "deactivating"].includes(parts[2] ?? ""))
+        .map((parts) => parts[0])
+        .filter((unit) => unit?.startsWith("context-mode-job-") && unit.endsWith(".service"));
+    } catch {
+      return [];
+    }
+  }
+
+  #processExists(pid: number): boolean {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+
+  #stopUnit(unit: string): void {
+    try {
+      execFileSync("/usr/bin/systemctl", ["--user", "stop", unit], {
+        env: systemdUserEnv(), stdio: "ignore", timeout: 10_000,
+      });
+    } catch { /* best effort; runtime cap remains the final guard */ }
+  }
 
   start(opts: { unit: string; cwd: string; command: string }): JobHandle {
     if (!existsSync("/usr/bin/systemd-run") || !existsSync("/usr/bin/systemctl")) {
@@ -168,6 +219,7 @@ export class SystemdJobRunner implements JobRunner {
 
     return {
       done,
+      snapshot: () => ({ stdoutTail: stdout.toString("utf8"), stderrTail: stderr.toString("utf8") }),
       cancel: async () => {
         try {
           execFileSync("/usr/bin/systemctl", ["--user", "stop", `${opts.unit}.service`], {
@@ -199,11 +251,17 @@ export class JobManager {
     this.#runner = opts?.runner ?? new SystemdJobRunner();
     this.#maxCompleted = opts?.maxCompleted ?? 32;
     this.#ttlMs = opts?.ttlMs ?? 60 * 60 * 1000;
+    this.#runner.reconcile?.();
+  }
+
+  isActive(): boolean {
+    return this.#activeId !== null;
   }
 
   start(opts: { command: string; cwd: string; expectedArtifacts?: string[] }): { jobId: string; done: Promise<void> } {
     this.#prune();
-    if (this.#activeId) {
+    if (!this.#activeId) this.#runner.reconcile?.();
+    if (this.#activeId || this.#runner.hasActiveJobs?.()) {
       console.error(`[context-mode] job busy active=${this.#activeId}`);
       throw new Error("busy: another async job is running");
     }
@@ -212,7 +270,7 @@ export class JobManager {
     if (!cwdStat.isDirectory()) throw new Error(`job cwd is not a directory: ${cwd}`);
     const expectedArtifacts = (opts.expectedArtifacts ?? []).map((path) => this.#resolveArtifact(cwd, path));
     const id = randomUUID();
-    const unit = `context-mode-job-${id.replace(/-/g, "")}`;
+    const unit = `context-mode-job-${process.pid}-${id.replace(/-/g, "")}`;
     const handle = this.#runner.start({ unit, cwd, command: opts.command });
     const record: JobRecord = {
       id,
@@ -288,6 +346,7 @@ export class JobManager {
   }
 
   #receipt(record: JobRecord): JobReceipt {
+    const live = record.status === "running" ? record.handle.snapshot?.() : undefined;
     const artifacts: JobArtifact[] = [];
     for (const path of record.expectedArtifacts) {
       try {
@@ -302,8 +361,8 @@ export class JobManager {
       started_at: record.startedAt,
       finished_at: record.finishedAt,
       termination_reason: record.terminationReason,
-      stdout_tail: record.stdoutTail,
-      stderr_tail: record.stderrTail,
+      stdout_tail: live?.stdoutTail ?? record.stdoutTail,
+      stderr_tail: live?.stderrTail ?? record.stderrTail,
       artifacts,
     };
   }

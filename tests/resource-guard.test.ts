@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PolyglotExecutor,
+  configuredJobAdmissionError,
   memoryAdmissionError,
   resolveBackgroundDetachTimeout,
   resolveForegroundTimeout,
@@ -78,6 +79,19 @@ describe("resource guards", () => {
       expect(existsSync(marker)).toBe(false);
     } finally {
       rmSync(marker, { force: true });
+    }
+  });
+
+  test("uses a separate memory admission threshold for heavy jobs", () => {
+    const previous = process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB;
+    process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB = "999999999";
+    try {
+      if (process.platform === "linux") {
+        expect(configuredJobAdmissionError()).toContain("requires 999999999 MiB");
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB;
+      else process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB = previous;
     }
   });
 

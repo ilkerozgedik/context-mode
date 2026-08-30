@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -106,6 +106,42 @@ describe("context-mode tool surface", () => {
     for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_job_start"]) {
       const tool = REGISTERED_CTX_TOOLS.find((candidate) => candidate.name === name);
       expect(tool?.config.description).toContain("OS permissions");
+    }
+  });
+
+  test("async job tools advertise correct MCP safety annotations", () => {
+    const start = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_start");
+    const status = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_status");
+    const cancel = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_cancel");
+    expect(start?.config.annotations).toEqual(expect.objectContaining({
+      readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
+    }));
+    expect(status?.config.annotations).toEqual(expect.objectContaining({
+      readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+    }));
+    expect(cancel?.config.annotations).toEqual(expect.objectContaining({
+      readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false,
+    }));
+  });
+
+  test("foreground execution is refused while an async job is active", async () => {
+    if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync(`/run/user/${process.getuid()}/bus`)) return;
+    const start = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_start")!;
+    const status = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_status")!;
+    const cancel = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_cancel")!;
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+    let jobId: string | undefined;
+    try {
+      const started = await start.handler({ command: "sleep 5", cwd: process.cwd() }) as { isError?: boolean; content: Array<{ text: string }> };
+      expect(started.isError).not.toBe(true);
+      jobId = (JSON.parse(started.content[0].text) as { job_id: string }).job_id;
+      const running = await status.handler({ job_id: jobId }) as { content: Array<{ text: string }> };
+      expect(JSON.parse(running.content[0].text).status).toBe("running");
+      const blocked = await execute.handler({ language: "shell", code: "echo should-not-run" }) as { isError?: boolean; content: Array<{ text: string }> };
+      expect(blocked.isError).toBe(true);
+      expect(blocked.content[0].text).toMatch(/async job.*running/i);
+    } finally {
+      if (jobId) await cancel.handler({ job_id: jobId });
     }
   });
 

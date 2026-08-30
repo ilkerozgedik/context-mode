@@ -12,20 +12,54 @@ import {
 
 class FakeRunner implements JobRunner {
   completions: Array<(value: JobCompletion) => void> = [];
+  tails: Array<{ stdoutTail: string; stderrTail: string }> = [];
   cancels = 0;
+  reconciles = 0;
+
+  reconcile(): void {
+    this.reconciles += 1;
+  }
 
   start(): JobHandle {
     let resolve!: (value: JobCompletion) => void;
     const done = new Promise<JobCompletion>((r) => { resolve = r; });
+    const tail = { stdoutTail: "", stderrTail: "" };
     this.completions.push(resolve);
+    this.tails.push(tail);
     return {
       done,
+      snapshot: () => ({ ...tail }),
       cancel: async () => { this.cancels += 1; },
     };
   }
 }
 
 describe("async jobs", () => {
+
+  test("reconciles stale runner jobs when the manager starts", () => {
+    const runner = new FakeRunner();
+    new JobManager({ runner });
+    expect(runner.reconciles).toBe(1);
+  });
+
+  test("reports bounded live output while a job is running", () => {
+    const runner = new FakeRunner();
+    const manager = new JobManager({ runner });
+    const root = mkdtempSync(join(tmpdir(), "context-mode-job-live-"));
+    try {
+      const started = manager.start({ command: "build", cwd: root });
+      runner.tails[0].stdoutTail = "compile 42%";
+      runner.tails[0].stderrTail = "warning";
+      expect(manager.status(started.jobId)).toEqual(expect.objectContaining({
+        status: "running",
+        stdout_tail: "compile 42%",
+        stderr_tail: "warning",
+      }));
+      runner.completions[0]({ exitCode: 0, stdoutTail: "done", stderrTail: "" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("admits only one active job and exposes a receipt after completion", async () => {
     const runner = new FakeRunner();
     const manager = new JobManager({ runner, maxCompleted: 4, ttlMs: 60_000 });
@@ -94,8 +128,12 @@ describe("async jobs", () => {
     expect(args).toContain("--property=TasksMax=128");
     expect(args).toContain("--property=CPUQuota=200%");
     expect(args).toContain("--property=RuntimeMaxSec=3600s");
+    expect(args).toContain("--property=NoNewPrivileges=yes");
+    expect(args).toContain("--property=UMask=0077");
+    expect(args).toContain("--setenv=LANG=en_US.UTF-8");
+    expect(args).toContain("--setenv=NO_COLOR=1");
     expect(args).toContain("--pipe");
     expect(args).toContain("--collect");
-    expect(args.slice(-3)).toEqual(["/bin/bash", "-lc", "godot --headless --export-debug Android app.apk"]);
+    expect(args.slice(-3)).toEqual(["/bin/bash", "-c", "godot --headless --export-debug Android app.apk"]);
   });
 });

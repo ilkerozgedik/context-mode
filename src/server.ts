@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
-import { PolyglotExecutor, configuredExecutionAdmissionError } from "./executor.js";
+import { PolyglotExecutor, configuredExecutionAdmissionError, configuredJobAdmissionError } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
 import { JobManager } from "./jobs.js";
 import { ContentStore, type IndexResult } from "./store.js";
@@ -83,6 +83,7 @@ export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
 
 const SERIALIZED_PROJECT_TOOLS = new Set([
   "ctx_execute",
+  "ctx_job_start",
   "ctx_execute_file",
   "ctx_index",
   "ctx_search",
@@ -137,7 +138,12 @@ function registerCtxTool(
     ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => withProjectToolLock(
         resolveExecutionProjectDir(typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined),
         ctx?.signal,
-        () => handler(toolArgs, ctx),
+        () => {
+          if (["ctx_execute", "ctx_execute_file", "ctx_batch_execute"].includes(name) && jobManager.isActive()) {
+            return { isError: true, content: [{ type: "text", text: "busy: async job is running; foreground execution is temporarily disabled" }] };
+          }
+          return handler(toolArgs, ctx);
+        },
       )
     : handler;
   REGISTERED_CTX_TOOLS.push({ name, config, handler: guardedHandler });
@@ -1057,6 +1063,8 @@ function intentSearch(
 registerCtxTool(
   "ctx_job_start",
   {
+    title: "Start resource-limited async job (uses MCP server OS permissions)",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     description: "Start one long-running shell job under a resource-limited systemd user service. Returns immediately with a job receipt; runs with the MCP server OS permissions.",
     inputSchema: z.object({
       command: z.string().min(1).describe("Shell command to run."),
@@ -1066,7 +1074,7 @@ registerCtxTool(
   },
   async ({ command, cwd, expected_artifacts }) => {
     try {
-      const admissionError = configuredExecutionAdmissionError();
+      const admissionError = configuredExecutionAdmissionError() ?? configuredJobAdmissionError();
       if (admissionError) throw new Error(admissionError);
       const projectDir = resolveExecutionProjectDir(cwd);
       const started = jobManager.start({ command, cwd: projectDir, expectedArtifacts: expected_artifacts });
@@ -1080,6 +1088,8 @@ registerCtxTool(
 registerCtxTool(
   "ctx_job_status",
   {
+    title: "Read async job status",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: "Read the current receipt for a previously started async job.",
     inputSchema: z.object({ job_id: z.string().min(1) }),
   },
@@ -1095,6 +1105,8 @@ registerCtxTool(
 registerCtxTool(
   "ctx_job_cancel",
   {
+    title: "Cancel async job",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description: "Cancel the active async job and return its final receipt.",
     inputSchema: z.object({ job_id: z.string().min(1) }),
   },
@@ -2556,7 +2568,7 @@ registerCtxTool(
     lines.push(`[OK] Runtimes: ${available.length} — ${available.join(", ")}`);
     const admission = configuredExecutionAdmissionError();
     lines.push(admission ? `[WARN] Admission: ${admission}` : "[OK] Admission: ready");
-    lines.push(`[OK] Limits: min available ${process.env.CONTEXT_MODE_MIN_AVAILABLE_MB ?? "disabled"} MiB; foreground ${process.env.CONTEXT_MODE_MAX_FOREGROUND_MS ?? "unlimited"} ms; batch concurrency ${getBatchConcurrencyLimit()}`);
+    lines.push(`[OK] Limits: min available ${process.env.CONTEXT_MODE_MIN_AVAILABLE_MB ?? "disabled"} MiB; job min available ${process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB ?? "disabled"} MiB; foreground ${process.env.CONTEXT_MODE_MAX_FOREGROUND_MS ?? "unlimited"} ms; batch concurrency ${getBatchConcurrencyLimit()}`);
 
     try {
       lines.push(`[OK] Storage content: ${getContentDir()}`);

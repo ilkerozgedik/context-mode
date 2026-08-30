@@ -45,14 +45,22 @@ export function resolveBackgroundDetachTimeout(
   return timeout === undefined ? maxDetachMs : Math.min(timeout, maxDetachMs);
 }
 
-export function configuredExecutionAdmissionError(): string | undefined {
-  const minimum = readNonNegativeEnv("CONTEXT_MODE_MIN_AVAILABLE_MB");
+function configuredMemoryAdmissionError(envName: string): string | undefined {
+  const minimum = readNonNegativeEnv(envName);
   if (minimum <= 0 || process.platform !== "linux") return undefined;
   try {
     return memoryAdmissionError(readFileSync("/proc/meminfo", "utf8"), minimum);
   } catch {
     return undefined;
   }
+}
+
+export function configuredExecutionAdmissionError(): string | undefined {
+  return configuredMemoryAdmissionError("CONTEXT_MODE_MIN_AVAILABLE_MB");
+}
+
+export function configuredJobAdmissionError(): string | undefined {
+  return configuredMemoryAdmissionError("CONTEXT_MODE_JOB_MIN_AVAILABLE_MB");
 }
 
 /**
