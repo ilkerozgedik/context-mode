@@ -11,6 +11,25 @@ type ToolContextOverride = { projectDir: string };
 const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
 const stores = new Map<string, ContentStore>();
 const DEFAULT_CONTENT_DIR = join(homedir(), ".claude", "context-mode", "content");
+const DEFAULT_MAX_OPEN_STORES = 8;
+
+function getMaxOpenStores(): number {
+  const raw = process.env.CONTEXT_MODE_MAX_OPEN_STORES?.trim();
+  if (!raw) return DEFAULT_MAX_OPEN_STORES;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MAX_OPEN_STORES;
+}
+
+function trimStoreCache(): void {
+  const maxOpenStores = getMaxOpenStores();
+  while (stores.size > maxOpenStores) {
+    const oldest = stores.entries().next().value as [string, ContentStore] | undefined;
+    if (!oldest) return;
+    const [scope, store] = oldest;
+    try { store.close(); } catch {}
+    stores.delete(scope);
+  }
+}
 
 export async function withProjectDirOverride<T>(
   projectDir: string | ToolContextOverride,
@@ -86,18 +105,26 @@ export function getStorePath(projectDir: string = getProjectDir()): string {
 export function getStore(projectDir: string = getProjectDir()): ContentStore {
   const scope = resolveProjectScope(projectDir);
   let store = stores.get(scope);
-  if (!store) {
-    store = new ContentStore(getStorePath(scope));
-    store.setDenyChecker((filePath: string) => {
-      try {
-        const denyGlobs = readToolDenyPatterns("Read", scope);
-        return evaluateFilePath(filePath, denyGlobs, process.platform === "win32", scope).denied;
-      } catch {
-        return true;
-      }
-    });
+  if (store) {
+    // Map insertion order is the LRU order. Current callers use stores synchronously,
+    // so evicting an older entry here cannot close a store mid-operation.
+    stores.delete(scope);
     stores.set(scope, store);
+    trimStoreCache();
+    return store;
   }
+
+  store = new ContentStore(getStorePath(scope));
+  store.setDenyChecker((filePath: string) => {
+    try {
+      const denyGlobs = readToolDenyPatterns("Read", scope);
+      return evaluateFilePath(filePath, denyGlobs, process.platform === "win32", scope).denied;
+    } catch {
+      return true;
+    }
+  });
+  stores.set(scope, store);
+  trimStoreCache();
   return store;
 }
 
