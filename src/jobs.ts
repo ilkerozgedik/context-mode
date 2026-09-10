@@ -89,9 +89,6 @@ export interface SystemdRunOptions {
   unit: string;
   cwd: string;
   command: string;
-  memoryHighMb: number;
-  memoryMaxMb: number;
-  memorySwapMaxMb: number;
   tasksMax: number;
   cpuQuotaPercent: number;
   runtimeMaxSec: number;
@@ -108,9 +105,6 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
     "--service-type=exec",
     "--quiet",
     `--working-directory=${opts.cwd}`,
-    `--property=MemoryHigh=${opts.memoryHighMb}M`,
-    `--property=MemoryMax=${opts.memoryMaxMb}M`,
-    `--property=MemorySwapMax=${opts.memorySwapMaxMb}M`,
     `--property=TasksMax=${opts.tasksMax}`,
     `--property=CPUQuota=${opts.cpuQuotaPercent}%`,
     `--property=RuntimeMaxSec=${opts.runtimeMaxSec}s`,
@@ -128,9 +122,6 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
 }
 
 export class SystemdJobRunner implements JobRunner {
-  readonly #memoryHighMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_HIGH_MB, 2048);
-  readonly #memoryMaxMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_MAX_MB, 2304);
-  readonly #memorySwapMaxMb = positiveInt(process.env.CONTEXT_MODE_JOB_MEMORY_SWAP_MAX_MB, 256);
   readonly #tasksMax = positiveInt(process.env.CONTEXT_MODE_JOB_TASKS_MAX, 128);
   readonly #cpuQuotaPercent = positiveInt(process.env.CONTEXT_MODE_JOB_CPU_QUOTA_PERCENT, 200);
   readonly #runtimeMaxSec = positiveInt(process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC, 3600);
@@ -218,9 +209,6 @@ export class SystemdJobRunner implements JobRunner {
     const env = systemdUserEnv();
     const args = buildSystemdRunArgs({
       ...opts,
-      memoryHighMb: this.#memoryHighMb,
-      memoryMaxMb: this.#memoryMaxMb,
-      memorySwapMaxMb: this.#memorySwapMaxMb,
       tasksMax: this.#tasksMax,
       cpuQuotaPercent: this.#cpuQuotaPercent,
       runtimeMaxSec: this.#runtimeMaxSec,
