@@ -26,8 +26,6 @@ export interface RunPoolOptions {
   concurrency: number;
   /** Optional: also clamp by `os.cpus().length` (memory-pressure safety). Default false. */
   capByCpuCount?: boolean;
-  /** Optional: per-settled callback (e.g. for progress reporting / metrics). */
-  onSettled?: (idx: number, result: PromiseSettledResult<unknown>) => void;
 }
 
 export interface RunPoolResult<T> {
@@ -43,7 +41,7 @@ export async function runPool<T>(
   jobs: PoolJob<T>[],
   opts: RunPoolOptions,
 ): Promise<RunPoolResult<T>> {
-  const { concurrency, capByCpuCount = false, onSettled } = opts;
+  const { concurrency, capByCpuCount = false } = opts;
 
   if (jobs.length === 0) {
     return { settled: [], effectiveConcurrency: 0, capped: false };
@@ -67,15 +65,12 @@ export async function runPool<T>(
       } catch (err) {
         settled[idx] = { status: "rejected", reason: err };
       }
-      onSettled?.(idx, settled[idx]);
     }
   }
 
   const workers: Promise<void>[] = [];
   for (let w = 0; w < effectiveConcurrency; w++) workers.push(worker());
-  // allSettled defends against any promise rejection escaping a worker
-  // (the worker already swallows its own errors, but this is belt-and-braces).
-  await Promise.allSettled(workers);
+  await Promise.all(workers);
 
   return { settled, effectiveConcurrency, capped };
 }

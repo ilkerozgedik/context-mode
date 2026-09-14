@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -112,6 +112,52 @@ describe("persistent core", () => {
 
 });
 
+
+
+describe("file-backed store refresh", () => {
+  test("removes previously indexed content when the Read deny policy changes", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "secret.txt");
+    writeFileSync(filePath, "policy_secret_94731");
+    const store = new ContentStore(join(dir, "deny.db"));
+    try {
+      store.setDenyChecker(() => false);
+      store.index({ path: filePath, source: "secret-source" });
+      expect(store.searchWithFallback("policy_secret_94731", 3)).toHaveLength(1);
+
+      store.setDenyChecker(() => true);
+      expect(store.searchWithFallback("policy_secret_94731", 3)).toHaveLength(0);
+      expect(store.getSourceMeta("secret-source")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("refreshes file metadata once per synchronous search batch", async () => {
+    const dir = tempDir();
+    const first = join(dir, "first.txt");
+    const second = join(dir, "second.txt");
+    writeFileSync(first, "alpha refresh marker");
+    writeFileSync(second, "beta refresh marker");
+    const store = new ContentStore(join(dir, "refresh.db"));
+    try {
+      store.index({ path: first, source: "first" });
+      store.index({ path: second, source: "second" });
+      let checks = 0;
+      store.setDenyChecker(() => { checks += 1; return false; });
+
+      store.searchWithFallback("alpha", 3);
+      store.searchWithFallback("beta", 3);
+      expect(checks).toBe(2);
+
+      await Promise.resolve();
+      store.searchWithFallback("alpha", 3);
+      expect(checks).toBe(4);
+    } finally {
+      store.close();
+    }
+  });
+});
 
 describe("bounded fetch body reader", () => {
   test("rejects oversized declared content before reading the body", async () => {

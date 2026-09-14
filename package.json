@@ -29,9 +29,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run typecheck && npm run bundle",
+    "build": "pnpm typecheck && pnpm bundle",
     "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --minify",
-    "dev": "npx tsx src/server.ts",
+    "dev": "pnpm exec tsx src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

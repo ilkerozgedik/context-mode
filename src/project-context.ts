@@ -115,10 +115,21 @@ export function getStore(projectDir: string = getProjectDir()): ContentStore {
   }
 
   store = new ContentStore(getStorePath(scope));
+  let cachedDenyGlobs: string[][] | undefined;
+  let denyCacheResetScheduled = false;
   store.setDenyChecker((filePath: string) => {
     try {
-      const denyGlobs = readToolDenyPatterns("Read", scope);
-      return evaluateFilePath(filePath, denyGlobs, process.platform === "win32", scope).denied;
+      if (cachedDenyGlobs === undefined) {
+        cachedDenyGlobs = readToolDenyPatterns("Read", scope);
+        if (!denyCacheResetScheduled) {
+          denyCacheResetScheduled = true;
+          queueMicrotask(() => {
+            cachedDenyGlobs = undefined;
+            denyCacheResetScheduled = false;
+          });
+        }
+      }
+      return evaluateFilePath(filePath, cachedDenyGlobs, process.platform === "win32", scope).denied;
     } catch {
       return true;
     }

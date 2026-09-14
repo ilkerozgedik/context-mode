@@ -74,38 +74,15 @@ export class ContentStore {
   // Prepared once at construction, reused on every call to avoid
   // re-compiling SQL on each invocation.
 
-  // Write path
+  // Write/delete path used directly by ContentStore. Search/read helpers own
+  // the remaining prepared statements through #statements.
   #stmtInsertSourceEmpty!: PreparedStatement;
   #stmtInsertSource!: PreparedStatement;
   #stmtInsertChunk!: PreparedStatement;
   #stmtInsertChunkTrigram!: PreparedStatement;
-  #stmtInsertVocab!: PreparedStatement;
-
-  // Dedup path (delete previous source with same label before re-indexing)
   #stmtDeleteChunksByLabel!: PreparedStatement;
   #stmtDeleteChunksTrigramByLabel!: PreparedStatement;
   #stmtDeleteSourcesByLabel!: PreparedStatement;
-
-  // Search path (hot)
-  #stmtSearchPorter!: PreparedStatement;
-  #stmtSearchPorterFiltered!: PreparedStatement;
-  #stmtSearchPorterExact!: PreparedStatement;
-  #stmtSearchTrigram!: PreparedStatement;
-  #stmtSearchTrigramFiltered!: PreparedStatement;
-  #stmtSearchTrigramExact!: PreparedStatement;
-  #stmtFuzzyVocab!: PreparedStatement;
-  #stmtSearchPorterContentType!: PreparedStatement;
-  #stmtSearchPorterFilteredContentType!: PreparedStatement;
-  #stmtSearchPorterExactContentType!: PreparedStatement;
-  #stmtSearchTrigramContentType!: PreparedStatement;
-  #stmtSearchTrigramFilteredContentType!: PreparedStatement;
-  #stmtSearchTrigramExactContentType!: PreparedStatement;
-
-  // Read path
-  #stmtChunksBySource!: PreparedStatement;
-  #stmtSourceChunkCount!: PreparedStatement;
-  #stmtChunkContent!: PreparedStatement;
-  #stmtSourceMeta!: PreparedStatement;
 
 
   // FTS5 optimization: track inserts and optimize periodically to defragment
@@ -151,27 +128,9 @@ export class ContentStore {
     this.#stmtInsertSource = statements.stmtInsertSource;
     this.#stmtInsertChunk = statements.stmtInsertChunk;
     this.#stmtInsertChunkTrigram = statements.stmtInsertChunkTrigram;
-    this.#stmtInsertVocab = statements.stmtInsertVocab;
     this.#stmtDeleteChunksByLabel = statements.stmtDeleteChunksByLabel;
     this.#stmtDeleteChunksTrigramByLabel = statements.stmtDeleteChunksTrigramByLabel;
     this.#stmtDeleteSourcesByLabel = statements.stmtDeleteSourcesByLabel;
-    this.#stmtSearchPorter = statements.stmtSearchPorter;
-    this.#stmtSearchPorterFiltered = statements.stmtSearchPorterFiltered;
-    this.#stmtSearchPorterExact = statements.stmtSearchPorterExact;
-    this.#stmtSearchTrigram = statements.stmtSearchTrigram;
-    this.#stmtSearchTrigramFiltered = statements.stmtSearchTrigramFiltered;
-    this.#stmtSearchTrigramExact = statements.stmtSearchTrigramExact;
-    this.#stmtSearchPorterContentType = statements.stmtSearchPorterContentType;
-    this.#stmtSearchPorterFilteredContentType = statements.stmtSearchPorterFilteredContentType;
-    this.#stmtSearchPorterExactContentType = statements.stmtSearchPorterExactContentType;
-    this.#stmtSearchTrigramContentType = statements.stmtSearchTrigramContentType;
-    this.#stmtSearchTrigramFilteredContentType = statements.stmtSearchTrigramFilteredContentType;
-    this.#stmtSearchTrigramExactContentType = statements.stmtSearchTrigramExactContentType;
-    this.#stmtFuzzyVocab = statements.stmtFuzzyVocab;
-    this.#stmtChunksBySource = statements.stmtChunksBySource;
-    this.#stmtSourceChunkCount = statements.stmtSourceChunkCount;
-    this.#stmtChunkContent = statements.stmtChunkContent;
-    this.#stmtSourceMeta = statements.stmtSourceMeta;
     this.#searchEngine = new StoreSearchEngine(statements, () => this.#refreshStaleSources());
   }
 
@@ -192,11 +151,11 @@ export class ContentStore {
   /**
    * Register a deny-policy checker. When set, #refreshStaleSources
    * calls it before re-reading any file_path during auto-refresh.
-   * Returning `true` causes the source to be skipped (kept in cache,
-   * not re-indexed). server.ts wires this to the Read deny patterns.
+   * Returning `true` removes the persisted source before search results are read.
    */
   setDenyChecker(fn: ((filePath: string) => boolean) | undefined): void {
     this.#denyChecker = fn;
+    this.#refreshCheckedThisTurn = false;
   }
 
   // ── Index ──
@@ -407,9 +366,7 @@ export class ContentStore {
     // then insert new content — all within a single transaction.
     // Prevents stale results in iterative workflows. (See: GitHub issue #67)
     const transaction = this.#db.transaction(() => {
-      this.#stmtDeleteChunksByLabel.run(label);
-      this.#stmtDeleteChunksTrigramByLabel.run(label);
-      this.#stmtDeleteSourcesByLabel.run(label);
+      this.#deleteSourceRows(label);
 
       if (boundedChunks.length === 0) {
         const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
@@ -489,6 +446,13 @@ export class ContentStore {
 
   /** Number of sources auto-refreshed in the last searchWithFallback call. */
   lastRefreshCount = 0;
+  #refreshCheckedThisTurn = false;
+
+  #deleteSourceRows(label: string): void {
+    this.#stmtDeleteChunksByLabel.run(label);
+    this.#stmtDeleteChunksTrigramByLabel.run(label);
+    this.#stmtDeleteSourcesByLabel.run(label);
+  }
 
   /**
    * Check all file-backed sources for staleness and auto re-index changed files.
@@ -496,6 +460,10 @@ export class ContentStore {
    * past indexed_at. Gracefully skips deleted files and non-file sources.
    */
   #refreshStaleSources(): void {
+    if (this.#refreshCheckedThisTurn) return;
+    this.#refreshCheckedThisTurn = true;
+    queueMicrotask(() => { this.#refreshCheckedThisTurn = false; });
+
     this.lastRefreshCount = 0;
     const sources = this.#db.prepare(
       "SELECT label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL",
@@ -506,9 +474,13 @@ export class ContentStore {
         if (!existsSync(src.file_path)) continue; // file deleted — keep cached results
         // Re-check deny policy before re-reading. The Read deny list may
         // have been edited after this source was originally indexed; a
-        // file that was allowed then may now be denied. Without this
-        // gate, refresh would happily re-read and re-expose it. #442 r3.
-        if (this.#denyChecker && this.#denyChecker(src.file_path)) continue;
+        // file that was allowed then may now be denied. Remove its persisted
+        // rows immediately so the next FTS query cannot return stale content.
+        if (this.#denyChecker && this.#denyChecker(src.file_path)) {
+          this.#db.transaction(() => this.#deleteSourceRows(src.label))();
+          this.#searchEngine.clearFuzzyCache();
+          continue;
+        }
         const mtime = statSync(src.file_path).mtime;
         const indexedAt = new Date(src.indexed_at + "Z");
         if (mtime <= indexedAt) continue; // file unchanged — fast path

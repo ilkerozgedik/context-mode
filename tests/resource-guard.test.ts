@@ -36,6 +36,67 @@ describe("resource guards", () => {
     }
   });
 
+  test("ctx_execute_file cancels its child process when the request aborts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-file-abort-"));
+    const marker = join(root, "late-marker");
+    writeFileSync(join(root, "input.txt"), "input");
+    const controller = new AbortController();
+    const executeFile = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute_file")!;
+    try {
+      const run = executeFile.handler({
+        path: "input.txt",
+        language: "javascript",
+        code: `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 250); setTimeout(() => {}, 1000);`,
+        timeout: 5000,
+        cwd: root,
+      }, { signal: controller.signal });
+      setTimeout(() => controller.abort(), 30);
+      await run;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("successful execution tools preserve stderr", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-success-stderr-"));
+    writeFileSync(join(root, "input.txt"), "input");
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+    const executeFile = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute_file")!;
+    try {
+      const direct = await execute.handler({
+        language: "shell",
+        code: "printf 'context-mode-direct-warning' >&2",
+        timeout: 1000,
+        cwd: root,
+      }) as { content: Array<{ text: string }> };
+      const file = await executeFile.handler({
+        path: "input.txt",
+        language: "javascript",
+        code: "console.error('context-mode-file-warning')",
+        timeout: 1000,
+        cwd: root,
+      }) as { content: Array<{ text: string }> };
+
+      expect(direct.content.map((part) => part.text).join("\n")).toContain("stderr:\ncontext-mode-direct-warning");
+      expect(file.content.map((part) => part.text).join("\n")).toContain("stderr:\ncontext-mode-file-warning");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ctx_execute reports a timeout with partial output as an error", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+    const result = await execute.handler({
+      language: "shell",
+      code: "printf partial-before-timeout; sleep 1",
+      timeout: 50,
+    }) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content.map((part) => part.text).join("\n")).toContain("partial-before-timeout");
+  });
+
   test("cleanup terminates an active foreground process tree", async () => {
     const executor = new PolyglotExecutor({ projectRoot: () => process.cwd() });
     const marker = join(tmpdir(), `context-mode-cleanup-${process.pid}-${Date.now()}`);

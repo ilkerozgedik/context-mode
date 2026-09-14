@@ -14,8 +14,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.5"
-      - run: npm install
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run bundle
+          node-version: "22.12"
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm bundle

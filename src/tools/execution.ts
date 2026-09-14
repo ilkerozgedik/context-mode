@@ -18,6 +18,13 @@ type RegisterTool = (
   handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
 ) => unknown;
 
+function formatProcessOutput(stdout: string | undefined, stderr: string | undefined, fallback = "(no output)"): string {
+  const parts: string[] = [];
+  if (stdout) parts.push(stdout);
+  if (stderr) parts.push(`stderr:\n${stderr}`);
+  return parts.join("\n\n") || fallback;
+}
+
 export function registerExecutionTools(registerCtxTool: RegisterTool): void {
   // ─────────────────────────────────────────────────────────
   // Tool: execute
@@ -148,23 +155,14 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
         }
 
         if (result.timedOut) {
-          const partialOutput = result.stdout?.trim();
-          if (partialOutput) {
-            // Timeout with partial output — return as success with note
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `${echo}${partialOutput}\n\n_(timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms — partial output shown above)_`,
-                },
-              ],
-            };
-          }
+          const partialOutput = formatProcessOutput(result.stdout, result.stderr, "");
           return {
             content: [
               {
                 type: "text" as const,
-                text: `${echo}Execution timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms\n\nstderr:\n${result.stderr}`,
+                text: partialOutput
+                  ? `${echo}${partialOutput}\n\n_(timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms — partial output shown above)_`
+                  : `${echo}Execution timed out after ${result.timeoutMs ?? timeout ?? "unknown"}ms`,
               },
             ],
             isError: true,
@@ -200,20 +198,20 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
           };
         }
 
-        const stdout = result.stdout || "(no output)";
+        const output = formatProcessOutput(result.stdout, result.stderr);
 
         // Intent-driven search: if intent provided and output is large enough
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           return {
             content: [
-              { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
+              { type: "text" as const, text: `${echo}${intentSearch(output, intent, `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
             ],
           };
         }
 
-        // Auto-index large stdout into FTS5 — return pointer, not raw content
-        if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-          const indexed = indexStdout(stdout, `execute:${language}`, resolveExecutionProjectDir(cwd));
+        // Auto-index large successful output into FTS5 — return pointer, not raw content
+        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+          const indexed = indexStdout(output, `execute:${language}`, resolveExecutionProjectDir(cwd));
           // Prepend echo to the first text content so provenance still surfaces
           const echoed = {
             ...indexed,
@@ -228,7 +226,7 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
 
         return {
           content: [
-            { type: "text" as const, text: `${echo}${stdout}` },
+            { type: "text" as const, text: `${echo}${output}` },
           ],
         };
       } catch (err: unknown) {
@@ -360,7 +358,8 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
           path,
           language,
           code,
-          timeout: timeout,
+          timeout,
+          signal: ctx?.signal,
         });
 
         // Echo path + executed source code before stdout for audit/debug
@@ -368,11 +367,12 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
         const echo = buildExecuteEcho(language, code, path);
 
         if (result.timedOut) {
+          const partialOutput = formatProcessOutput(result.stdout, result.stderr, "");
           return {
             content: [
               {
                 type: "text" as const,
-                text: `${echo}Timed out processing ${path} after ${result.timeoutMs ?? timeout ?? "unknown"}ms`,
+                text: `${echo}${partialOutput ? `${partialOutput}\n\n` : ""}Timed out processing ${path} after ${result.timeoutMs ?? timeout ?? "unknown"}ms`,
               },
             ],
             isError: true,
@@ -408,19 +408,19 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
           };
         }
 
-        const stdout = result.stdout || "(no output)";
+        const output = formatProcessOutput(result.stdout, result.stderr);
 
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           return {
             content: [
-              { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
+              { type: "text" as const, text: `${echo}${intentSearch(output, intent, `file:${path}`)}` },
             ],
           };
         }
 
-        // Auto-index large stdout into FTS5 — return pointer, not raw content
-        if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-          const indexed = indexStdout(stdout, `file:${path}`);
+        // Auto-index large successful output into FTS5 — return pointer, not raw content
+        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+          const indexed = indexStdout(output, `file:${path}`);
           const echoed = {
             ...indexed,
             content: indexed.content.map((c, i) =>
@@ -434,7 +434,7 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
 
         return {
           content: [
-            { type: "text" as const, text: `${echo}${stdout}` },
+            { type: "text" as const, text: `${echo}${output}` },
           ],
         };
       } catch (err: unknown) {
