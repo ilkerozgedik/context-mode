@@ -86,6 +86,33 @@ describe("resource guards", () => {
     }
   });
 
+  test("ctx_execute preserves native fetch resolution semantics", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+    const result = await execute.handler({
+      language: "javascript",
+      timeout: 3000,
+      code: `
+        const http = require("node:http");
+        const server = http.createServer((_req, res) => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.flushHeaders();
+          setTimeout(() => res.end("done"), 800);
+        });
+        await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address();
+        const started = Date.now();
+        const response = await fetch("http://127.0.0.1:" + address.port + "/");
+        console.log("fetch-resolution-ms=" + (Date.now() - started));
+        await response.body?.cancel();
+        await new Promise((resolve) => server.close(resolve));
+      `,
+    });
+    expect(result.isError).not.toBe(true);
+    const text = result.content.map((part: { text?: string }) => part.text ?? "").join("\n");
+    const elapsed = Number(text.match(/fetch-resolution-ms=(\d+)/)?.[1]);
+    expect(elapsed).toBeLessThan(500);
+  });
+
   test("ctx_execute reports a timeout with partial output as an error", async () => {
     const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
     const result = await execute.handler({

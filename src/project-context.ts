@@ -129,7 +129,7 @@ export function getStore(projectDir: string = getProjectDir()): ContentStore {
           });
         }
       }
-      return evaluateFilePath(filePath, cachedDenyGlobs, process.platform === "win32", scope).denied;
+      return evaluateFilePath(filePath, cachedDenyGlobs, process.platform === "win32" || process.platform === "darwin", scope).denied;
     } catch {
       return true;
     }

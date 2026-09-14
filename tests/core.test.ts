@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
 import { evaluateFilePath, isPathInsideProject, readToolDenyPatterns } from "../src/security.js";
+import { createPerFileReadDeny } from "../src/tools/security.js";
 import { ContentStore } from "../src/store.js";
 import { buildFetchCode, readResponseTextWithLimit } from "../src/fetch.js";
 
@@ -52,6 +53,27 @@ describe("security", () => {
     const root = tempDir();
     expect(isPathInsideProject("inside.txt", root)).toBe(true);
     expect(isPathInsideProject("../parent.txt", root)).toBe(false);
+  });
+
+  test("fails closed when an existing permission settings file is malformed", () => {
+    const root = tempDir();
+    mkdirSync(join(root, ".claude"));
+    writeFileSync(join(root, ".claude", "settings.json"), "{");
+    expect(() => readToolDenyPatterns("Read", root)).toThrow(/settings|json|parse/i);
+  });
+
+  test("Read deny matching remains case-insensitive on macOS callers", () => {
+    const root = tempDir();
+    mkdirSync(join(root, ".claude"));
+    writeFileSync(join(root, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(Secret.txt)"] } }));
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...original, value: "darwin" });
+      const denied = createPerFileReadDeny(root);
+      expect(denied(join(root, "secret.txt"))).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", original);
+    }
   });
 });
 
@@ -135,6 +157,32 @@ describe("file-backed store refresh", () => {
       );
       expect(store.searchWithFallback("policy_secret_94731", 3)).toHaveLength(0);
       expect(store.getSourceMeta("secret-source")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("revokes persisted content after the indexed file is deleted and then denied", async () => {
+    const dir = tempDir();
+    const filePath = join(dir, "deleted-secret.txt");
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(filePath, "deleted_policy_secret_58317");
+    const store = new ContentStore(join(dir, "deleted-deny.db"));
+    store.setDenyChecker((path) =>
+      evaluateFilePath(path, readToolDenyPatterns("Read", dir), false, dir).denied,
+    );
+    try {
+      store.index({ path: filePath, source: "deleted-secret-source" });
+      expect(store.searchWithFallback("deleted_policy_secret_58317", 3)).toHaveLength(1);
+      await Promise.resolve();
+
+      rmSync(filePath);
+      writeFileSync(
+        join(dir, ".claude", "settings.json"),
+        JSON.stringify({ permissions: { deny: ["Read(deleted-secret.txt)"] } }),
+      );
+      expect(store.searchWithFallback("deleted_policy_secret_58317", 3)).toHaveLength(0);
+      expect(store.getSourceMeta("deleted-secret-source")).toBeNull();
     } finally {
       store.close();
     }

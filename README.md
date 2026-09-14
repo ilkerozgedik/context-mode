@@ -14,7 +14,7 @@ context-mode --transport stdio
 context-mode --transport http --host 127.0.0.1 --port 3050
 ```
 
-The HTTP endpoint is `/mcp`; readiness is exposed at `/healthz`. HTTP mode is intentionally restricted to loopback and validates Host and Origin headers.
+The HTTP endpoint is `/mcp`; liveness is exposed at `/healthz` and readiness at `/readyz`. HTTP mode is intentionally restricted to loopback and validates Host and Origin headers.
 
 Context Mode serves MCP revision `2026-07-28` only, using stateless per-request server instances. 2025-era `initialize` traffic and MCP sessions are rejected.
 

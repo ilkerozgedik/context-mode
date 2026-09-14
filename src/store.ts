@@ -471,16 +471,15 @@ export class ContentStore {
 
     for (const src of sources) {
       try {
-        if (!existsSync(src.file_path)) continue; // file deleted — keep cached results
-        // Re-check deny policy before re-reading. The Read deny list may
-        // have been edited after this source was originally indexed; a
-        // file that was allowed then may now be denied. Remove its persisted
-        // rows immediately so the next FTS query cannot return stale content.
+        // Re-check deny policy before any filesystem fast path. A previously
+        // indexed file may have been deleted before the policy changed; its
+        // persisted chunks must still be revoked when the path becomes denied.
         if (this.#denyChecker && this.#denyChecker(src.file_path)) {
           this.#db.transaction(() => this.#deleteSourceRows(src.label))();
           this.#searchEngine.clearFuzzyCache();
           continue;
         }
+        if (!existsSync(src.file_path)) continue; // deleted but still allowed — keep cached results
         const mtime = statSync(src.file_path).mtime;
         const indexedAt = new Date(src.indexed_at + "Z");
         if (mtime <= indexedAt) continue; // file unchanged — fast path

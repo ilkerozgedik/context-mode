@@ -230,7 +230,7 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
       inputSchema: z.object({
         cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
         queries: z.array(z.string()).min(1).describe("Array of search queries. Batch ALL questions in one call."),
-        limit: z.coerce.number().optional().default(3).describe("Results per query (default: 3)"),
+        limit: z.coerce.number().int().min(1).optional().default(3).describe("Results per query (default: 3)"),
         source: z.string().optional().describe("Filter to a specific indexed source (partial match)."),
         contentType: z.enum(["code", "prose"]).optional().describe("Filter results by content type: 'code' or 'prose'."),
       }),

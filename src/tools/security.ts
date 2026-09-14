@@ -44,7 +44,7 @@ export function checkFilePathDenyPolicy(filePath: string): ToolResult | null {
   try {
     const projectDir = getProjectDir();
     const denyGlobs = readToolDenyPatterns("Read", projectDir);
-    const result = evaluateFilePath(filePath, denyGlobs, process.platform === "win32", projectDir);
+    const result = evaluateFilePath(filePath, denyGlobs, (process.platform === "win32" || process.platform === "darwin"), projectDir);
     if (result.denied) {
       return {
         content: [{
@@ -62,10 +62,10 @@ export function checkFilePathDenyPolicy(filePath: string): ToolResult | null {
 
 export function createPerFileReadDeny(projectDir: string): (absolutePath: string) => boolean {
   const denyGlobs = readToolDenyPatterns("Read", projectDir);
-  const isWin32 = process.platform === "win32";
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
   return (absolutePath: string): boolean => {
     try {
-      return evaluateFilePath(absolutePath, denyGlobs, isWin32, projectDir).denied;
+      return evaluateFilePath(absolutePath, denyGlobs, caseInsensitive, projectDir).denied;
     } catch {
       return false;
     }

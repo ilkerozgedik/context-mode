@@ -132,6 +132,15 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({ language: "shell", code: "echo should-not-run", background: true }).success).toBe(false);
   });
 
+  test("ctx_search rejects non-positive and fractional result limits", () => {
+    const search = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_search")!;
+    const schema = search.config.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    expect(schema.safeParse({ queries: ["x"], limit: 1 }).success).toBe(true);
+    expect(schema.safeParse({ queries: ["x"], limit: 0 }).success).toBe(false);
+    expect(schema.safeParse({ queries: ["x"], limit: -1 }).success).toBe(false);
+    expect(schema.safeParse({ queries: ["x"], limit: 1.5 }).success).toBe(false);
+  });
+
   test("ctx_batch_execute caps a request at eight commands", () => {
     const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute")!;
     const schema = batch.config.inputSchema as { safeParse(value: unknown): { success: boolean } };

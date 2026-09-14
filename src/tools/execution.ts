@@ -67,92 +67,20 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
     },
     async ({ language, code, timeout, cwd, intent }, ctx) => {
       try {
-        // For JavaScript: wrap in async IIFE with fetch + http/https interceptors to track network bytes
-        let instrumentedCode = code;
+        // Preserve top-level await ergonomics without monkey-patching user APIs.
+        // Execution observability must not alter fetch/fs semantics.
+        let executableCode = code;
         if (language === "javascript") {
-          // Wrap user code in a closure that shadows CJS require with http/https interceptor.
-          // globalThis.require does NOT work because CJS require is module-scoped, not global.
-          // The closure approach (function(__cm_req){ var require=...; })(require) correctly
-          // shadows the CJS require for all code inside, including __cm_main().
-          instrumentedCode = `
-  // FS read instrumentation — count bytes read via fs.readFileSync/readFile
-  let __cm_fs=0;
-  process.on('exit',()=>{if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch{}});
-  (function(){
-    try{
-      var f=typeof require!=='undefined'?require('fs'):null;
-      if(!f)return;
-      var ors=f.readFileSync;
-      f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};
-      var orf=f.readFile;
-      if(orf)f.readFile=function(){var a=Array.from(arguments),cb=a.pop();orf.apply(this,a.concat([function(e,d){if(!e&&d){if(Buffer.isBuffer(d))__cm_fs+=d.length;else if(typeof d==='string')__cm_fs+=Buffer.byteLength(d);}cb(e,d);}]));};
-    }catch{}
-  })();
-  let __cm_net=0;
-  // Report network bytes on process exit — works with both promise and callback patterns.
-  // process.on('exit') fires after all I/O completes, unlike .finally() which fires
-  // when __cm_main() resolves (immediately for callback-based http.get without await).
-  process.on('exit',()=>{if(__cm_net>0)try{process.stderr.write('__CM_NET__:'+__cm_net+'\\n')}catch{}});
-  ;(function(__cm_req){
-  // Intercept globalThis.fetch
-  const __cm_f=globalThis.fetch;
-  globalThis.fetch=async(...a)=>{const r=await __cm_f(...a);
-  try{const cl=r.clone();const b=await cl.arrayBuffer();__cm_net+=b.byteLength}catch{}
-  return r};
-  // Shadow CJS require with http/https network tracking.
-  const __cm_hc=new Map();
-  const __cm_hm=new Set(['http','https','node:http','node:https']);
-  function __cm_wf(m,origFn){return function(...a){
-    const li=a.length-1;
-    if(li>=0&&typeof a[li]==='function'){const oc=a[li];a[li]=function(res){
-      res.on('data',function(c){__cm_net+=c.length});oc(res);};}
-    const req=origFn.apply(m,a);
-    const oOn=req.on.bind(req);
-    req.on=function(ev,cb,...r){
-      if(ev==='response'){return oOn(ev,function(res){
-        res.on('data',function(c){__cm_net+=c.length});cb(res);
-      },...r);}
-      return oOn(ev,cb,...r);
-    };
-    return req;
-  }}
-  var require=__cm_req?function(id){
-    const m=__cm_req(id);
-    if(!__cm_hm.has(id))return m;
-    const k=id.replace('node:','');
-    if(__cm_hc.has(k))return __cm_hc.get(k);
-    const w=Object.create(m);
-    if(typeof m.get==='function')w.get=__cm_wf(m,m.get);
-    if(typeof m.request==='function')w.request=__cm_wf(m,m.request);
-    __cm_hc.set(k,w);return w;
-  }:__cm_req;
-  if(__cm_req){if(__cm_req.resolve)require.resolve=__cm_req.resolve;
-  if(__cm_req.cache)require.cache=__cm_req.cache;}
-  async function __cm_main(){
-  ${code}
-  }
-  __cm_main().catch(e=>{console.error(e);process.exitCode=1});
-  })(typeof require!=='undefined'?require:null);`;
+          executableCode = `;(async () => {
+${code}
+})().catch(e=>{console.error(e);process.exitCode=1});`;
         }
-        const result = await executor.execute({ language, code: instrumentedCode, timeout, cwd, signal: ctx?.signal });
+        const result = await executor.execute({ language, code: executableCode, timeout, cwd, signal: ctx?.signal });
 
         // Echo the executed source code before stdout so users can audit
         // and host approval UIs can audit the exact payload (Issues #717 + #736).
         // Built from the user-supplied `code`, NOT the instrumented variant.
         const echo = buildExecuteEcho(language, code);
-
-        // Parse sandbox network metrics from stderr
-        const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
-        if (netMatch) {
-          // Clean the metric line from stderr
-          result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
-        }
-
-        // Parse sandbox FS read metrics from stderr
-        const fsMatch = result.stderr?.match(/__CM_FS__:(\d+)/);
-        if (fsMatch) {
-          result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
-        }
 
         if (result.timedOut) {
           const partialOutput = formatProcessOutput(result.stdout, result.stderr, "");

@@ -115,15 +115,16 @@ export function readToolPermissionPatterns(
     let raw: string;
     try {
       raw = readFileSync(path, "utf-8");
-    } catch {
-      return null;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw new Error(`Failed to read permission settings: ${path}`);
     }
 
     let parsed: any;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return null;
+      throw new Error(`Invalid JSON in permission settings: ${path}`);
     }
 
     const entries = parsed?.permissions?.[kind];
