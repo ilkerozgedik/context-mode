@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { PolyglotExecutor } from "../src/executor.js";
 import { detectRuntimes, getAvailableLanguages, isAllowlistedShell } from "../src/runtime.js";
-import { isPathInsideProject } from "../src/security.js";
+import { evaluateFilePath, isPathInsideProject, readToolDenyPatterns } from "../src/security.js";
 import { ContentStore } from "../src/store.js";
 import { buildFetchCode, readResponseTextWithLimit } from "../src/fetch.js";
 
@@ -115,17 +115,24 @@ describe("persistent core", () => {
 
 
 describe("file-backed store refresh", () => {
-  test("removes previously indexed content when the Read deny policy changes", () => {
+  test("removes previously indexed content when the Read deny policy changes", async () => {
     const dir = tempDir();
     const filePath = join(dir, "secret.txt");
+    mkdirSync(join(dir, ".claude"));
     writeFileSync(filePath, "policy_secret_94731");
     const store = new ContentStore(join(dir, "deny.db"));
+    store.setDenyChecker((path) =>
+      evaluateFilePath(path, readToolDenyPatterns("Read", dir), false, dir).denied,
+    );
     try {
-      store.setDenyChecker(() => false);
       store.index({ path: filePath, source: "secret-source" });
       expect(store.searchWithFallback("policy_secret_94731", 3)).toHaveLength(1);
+      await Promise.resolve();
 
-      store.setDenyChecker(() => true);
+      writeFileSync(
+        join(dir, ".claude", "settings.json"),
+        JSON.stringify({ permissions: { deny: ["Read(secret.txt)"] } }),
+      );
       expect(store.searchWithFallback("policy_secret_94731", 3)).toHaveLength(0);
       expect(store.getSourceMeta("secret-source")).toBeNull();
     } finally {

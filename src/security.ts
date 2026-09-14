@@ -197,19 +197,25 @@ export function evaluateFilePath(
 ): { denied: boolean; matchedPattern?: string } {
   const toForward = (path: string): string => path.replace(/\\/g, "/");
 
-  // Match against the raw input, the lexically-resolved absolute path,
-  // and the canonical (symlink-resolved) path when the file exists.
-  // Deduplicated so absolute inputs and paths that don't cross symlinks
-  // don't pay the matching cost multiple times.
+  // Match against the raw input plus project-relative, resolved absolute, and
+  // canonical forms. The project-relative candidate matters when a persisted
+  // absolute file_path is re-checked against a rule such as Read(secret.txt).
+  // Deduplicated so equivalent forms do not add matching work.
   const candidates = new Set<string>();
   candidates.add(toForward(filePath));
   if (projectRoot) {
-    const lexical = resolve(projectRoot, filePath);
+    const root = resolve(projectRoot);
+    const lexical = resolve(root, filePath);
+    const lexicalRelative = relative(root, lexical);
+    if (lexicalRelative) candidates.add(toForward(lexicalRelative));
     candidates.add(toForward(lexical));
     try {
-      candidates.add(toForward(realpathSync(lexical)));
+      const canonical = realpathSync(lexical);
+      const canonicalRelative = relative(root, canonical);
+      if (canonicalRelative) candidates.add(toForward(canonicalRelative));
+      candidates.add(toForward(canonical));
     } catch {
-      // File does not exist yet, or realpath failed — rely on lexical form.
+      // File does not exist yet, or realpath failed — rely on lexical forms.
     }
   }
 
