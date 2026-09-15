@@ -1,10 +1,6 @@
-import { unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { z } from "zod";
-import { executor, runtimes } from "../app-runtime.js";
+import { executor } from "../app-runtime.js";
 import {
-  buildBatchNodeOptionsPrefix,
   getBatchConcurrencyLimit,
   runBatchCommands,
   truncateCommandForEcho,
@@ -12,30 +8,7 @@ import {
 import { capIndexableOutput, INDEX_OUTPUT_CAP_BYTES } from "../output-index.js";
 import { getStore, resolveExecutionProjectDir } from "../project-context.js";
 import { formatBatchQueryResults } from "../search-format.js";
-
-type RegisterTool = (
-  name: string,
-  config: Record<string, unknown>,
-  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-) => unknown;
-
-// ─────────────────────────────────────────────────────────
-// FS read tracking preload for ctx_batch_execute
-// ─────────────────────────────────────────────────────────
-// NODE_OPTIONS is denied by the executor's #buildSafeEnv (security).
-// Instead, we inject it as an inline shell env prefix in each batch command.
-// This temp file is loaded via --require when batch commands spawn Node processes.
-const CM_FS_PRELOAD = join(tmpdir(), `cm-fs-preload-${process.pid}.js`);
-writeFileSync(
-  CM_FS_PRELOAD,
-  `(function(){var __cm_fs=0;process.on('exit',function(){if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch(e){}});try{var f=require('fs');var ors=f.readFileSync;f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};}catch(e){}})();\n`,
-);
-// Best-effort cleanup in case the process exits before main() shutdown.
-process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
-
-export function cleanupBatchInstrumentation(): void {
-  try { unlinkSync(CM_FS_PRELOAD); } catch {}
-}
+import type { RegisterTool } from "./registry.js";
 
 export function registerBatchTools(registerCtxTool: RegisterTool): void {
   // ─────────────────────────────────────────────────────────
@@ -98,19 +71,13 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
     },
     async ({ commands, queries, timeout, concurrency, cwd, query_scope }, ctx) => {
       try {
-        // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
-        // The executor denies NODE_OPTIONS in its env (security), so we set it
-        // as an inline shell prefix. This only affects child `node` invocations.
-        const nodeOptsPrefix = buildBatchNodeOptionsPrefix(runtimes.shell, CM_FS_PRELOAD);
-
         // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
         // Concurrency>1 switches to a worker pool with per-command timeouts.
         const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
           commands,
           {
-            timeout: timeout,
+            timeout,
             concurrency,
-            nodeOptsPrefix,
             cwd,
             signal: ctx?.signal,
           },

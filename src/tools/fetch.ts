@@ -4,12 +4,7 @@ import { executor } from "../app-runtime.js";
 import { resolveConfiguredConcurrency } from "../batch.js";
 import { fetchOneUrl, indexFetched, type FetchOneResult, type IndexedFetchResult } from "../fetch.js";
 import { runPool, type PoolJob } from "../runPool.js";
-
-type RegisterTool = (
-  name: string,
-  config: Record<string, unknown>,
-  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-) => unknown;
+import type { RegisterTool } from "./registry.js";
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Request cancelled");

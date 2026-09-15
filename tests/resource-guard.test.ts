@@ -237,7 +237,7 @@ describe("resource guards", () => {
     };
     const result = await runBatchCommands(
       Array.from({ length: 8 }, (_, i) => ({ label: `cmd-${i}`, command: "true" })),
-      { timeout: 5000, concurrency: 2, nodeOptsPrefix: "" },
+      { timeout: 5000, concurrency: 2 },
       executor,
     );
     expect(result.outputs).toHaveLength(8);

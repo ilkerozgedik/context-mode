@@ -1,4 +1,5 @@
 import { runPool, type PoolJob } from "./runPool.js";
+import { readPositiveEnv } from "./env.js";
 
 export interface BatchCommand { label: string; command: string; }
 
@@ -11,9 +12,7 @@ export interface BatchRunOptions {
   /** Total budget (serial) or per-command budget (parallel). */
   timeout: number | undefined;
   concurrency: number;
-  nodeOptsPrefix: string;
   cwd?: string;
-  onFsBytes?: (bytes: number) => void;
   signal?: AbortSignal;
 }
 
@@ -28,13 +27,6 @@ interface BatchExecutor {
   }): Promise<{ stdout: string; stderr?: string; timedOut?: boolean; timeoutMs?: number }>;
 }
 
-function readPositiveEnv(name: string, defaultValue: number): number {
-  const raw = process.env[name];
-  if (!raw) return defaultValue;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
-}
-
 export function getBatchConcurrencyLimit(): number {
   return Math.min(8, Math.floor(readPositiveEnv("CONTEXT_MODE_MAX_BATCH_CONCURRENCY", 8)));
 }
@@ -43,26 +35,6 @@ export function resolveConfiguredConcurrency(requested: number): number {
   return Math.min(Math.max(1, Math.floor(requested)), getBatchConcurrencyLimit());
 }
 
-function quotePosixSingle(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function quotePowerShellSingle(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-export function buildBatchNodeOptionsPrefix(shellPath: string, preloadPath: string): string {
-  const option = `--require ${preloadPath}`;
-  const shell = shellPath.toLowerCase();
-  const base = shell.split(/[\\/]/).pop() ?? shell;
-  if (shell.includes("powershell") || shell.includes("pwsh")) {
-    return `$env:NODE_OPTIONS=${quotePowerShellSingle(option)}; `;
-  }
-  if (base === "cmd" || base === "cmd.exe") {
-    return `set "NODE_OPTIONS=${option.replace(/"/g, '""')}" && `;
-  }
-  return `export NODE_OPTIONS=${quotePosixSingle(option)}; `;
-}
 
 const COMMAND_ECHO_MAX = 500;
 const CODE_ECHO_MAX = 2000;
@@ -81,14 +53,8 @@ export function buildExecuteEcho(language: string, code: string, path?: string):
   return `${header}\`\`\`${language}\n${truncateCodeForEcho(code)}\n\`\`\`\n\n`;
 }
 
-function formatCommandOutput(label: string, command: string, raw: string, onFsBytes?: (bytes: number) => void): string {
-  let output = raw || "(no output)";
-  let cmdFsBytes = 0;
-  for (const match of output.matchAll(/__CM_FS__:(\d+)/g)) cmdFsBytes += parseInt(match[1]);
-  if (cmdFsBytes > 0) {
-    onFsBytes?.(cmdFsBytes);
-    output = output.replace(/__CM_FS__:\d+\n?/g, "");
-  }
+function formatCommandOutput(label: string, command: string, raw: string): string {
+  const output = raw || "(no output)";
   return `# ${label}\n\n$ ${truncateCommandForEcho(command)}\n\n${output}\n`;
 }
 
@@ -107,7 +73,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes, signal } = opts;
+  const { timeout, concurrency, cwd, signal } = opts;
   const effectiveConcurrency = resolveConfiguredConcurrency(concurrency);
   if (effectiveConcurrency <= 1) {
     const outputs: string[] = [];
@@ -126,9 +92,9 @@ export async function runBatchCommands(
         perCmdTimeout = remaining;
       }
       const result = await executor.execute({
-        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout: perCmdTimeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
+        language: "shell", code: cmd.command, timeout: perCmdTimeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
-      outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
+      outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result)));
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -143,9 +109,9 @@ export async function runBatchCommands(
   const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
     run: async () => {
       const result = await executor.execute({
-        language: "shell", code: `${nodeOptsPrefix}${cmd.command}`, timeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
+        language: "shell", code: cmd.command, timeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
-      const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
+      const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result));
       const output = result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${result.timeoutMs ?? timeout ?? "?"}ms)\n`
         : formatted;

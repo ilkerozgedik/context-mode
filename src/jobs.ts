@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve, sep } from "node:path";
+import { readPositiveIntEnv } from "./env.js";
 import { resolveProjectScope } from "./project-context.js";
 
 export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
@@ -61,10 +62,6 @@ interface JobRecord {
   cancelRequested: boolean;
 }
 
-function positiveInt(value: string | undefined, fallback: number): number {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 function systemdUserEnv(): NodeJS.ProcessEnv {
   if (process.platform !== "linux" || typeof process.getuid !== "function") {
@@ -122,10 +119,10 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
 }
 
 export class SystemdJobRunner implements JobRunner {
-  readonly #tasksMax = positiveInt(process.env.CONTEXT_MODE_JOB_TASKS_MAX, 128);
-  readonly #cpuQuotaPercent = positiveInt(process.env.CONTEXT_MODE_JOB_CPU_QUOTA_PERCENT, 200);
-  readonly #runtimeMaxSec = positiveInt(process.env.CONTEXT_MODE_JOB_RUNTIME_MAX_SEC, 3600);
-  readonly #tailBytes = positiveInt(process.env.CONTEXT_MODE_JOB_LOG_TAIL_BYTES, 64 * 1024);
+  readonly #tasksMax = readPositiveIntEnv("CONTEXT_MODE_JOB_TASKS_MAX", 128);
+  readonly #cpuQuotaPercent = readPositiveIntEnv("CONTEXT_MODE_JOB_CPU_QUOTA_PERCENT", 200);
+  readonly #runtimeMaxSec = readPositiveIntEnv("CONTEXT_MODE_JOB_RUNTIME_MAX_SEC", 3600);
+  readonly #tailBytes = readPositiveIntEnv("CONTEXT_MODE_JOB_LOG_TAIL_BYTES", 64 * 1024);
 
   reconcile(): void {
     for (const { unit } of this.#listJobUnits()) {
@@ -304,8 +301,8 @@ export class JobManager {
     this.#runner = opts?.runner ?? new SystemdJobRunner();
     this.#maxCompleted = opts?.maxCompleted ?? 32;
     this.#ttlMs = opts?.ttlMs ?? 60 * 60 * 1000;
-    this.#maxActive = opts?.maxActive ?? positiveInt(process.env.CONTEXT_MODE_MAX_ASYNC_JOBS, 2);
-    this.#maxActivePerProject = opts?.maxActivePerProject ?? positiveInt(process.env.CONTEXT_MODE_MAX_ASYNC_JOBS_PER_PROJECT, 1);
+    this.#maxActive = opts?.maxActive ?? readPositiveIntEnv("CONTEXT_MODE_MAX_ASYNC_JOBS", 2);
+    this.#maxActivePerProject = opts?.maxActivePerProject ?? readPositiveIntEnv("CONTEXT_MODE_MAX_ASYNC_JOBS_PER_PROJECT", 1);
     this.#runner.reconcile?.();
   }
 

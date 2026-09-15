@@ -6,12 +6,7 @@ import { getBatchConcurrencyLimit } from "../batch.js";
 import { loadDatabase } from "../db-base.js";
 import { PolyglotExecutor, configuredExecutionAdmissionError } from "../executor.js";
 import { closeProjectStore, getContentDir, getProjectDir, projectHash } from "../project-context.js";
-
-type RegisterTool = (
-  name: string,
-  config: Record<string, unknown>,
-  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-) => unknown;
+import type { RegisterTool } from "./registry.js";
 
 export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: string): void {
   // ── ctx-doctor: diagnostics (server-side) ─────────────────────────────────

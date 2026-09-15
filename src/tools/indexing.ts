@@ -1,14 +1,10 @@
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { z } from "zod";
+import { readPositiveEnv } from "../env.js";
 import { getProjectDir, getStore, resolveProjectPath } from "../project-context.js";
 import { extractSnippet } from "../search-format.js";
 import { checkFilePathDenyPolicy, checkProjectBoundary, createPerFileReadDeny } from "./security.js";
-
-type RegisterTool = (
-  name: string,
-  config: Record<string, unknown>,
-  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-) => unknown;
+import type { RegisterTool } from "./registry.js";
 
 export function registerIndexingTools(registerCtxTool: RegisterTool): void {
   // ─────────────────────────────────────────────────────────
@@ -193,13 +189,6 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
   // ─────────────────────────────────────────────────────────
   // Tool: search — progressive throttling
   // ─────────────────────────────────────────────────────────
-
-  function readPositiveEnv(name: string, defaultValue: number): number {
-    const raw = process.env[name];
-    if (!raw) return defaultValue;
-    const parsed = Number(raw);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
-  }
 
   const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
   const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3);

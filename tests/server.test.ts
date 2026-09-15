@@ -132,6 +132,24 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({ language: "shell", code: "echo should-not-run", background: true }).success).toBe(false);
   });
 
+  test("large shell soft-fail output keeps non-error intent-search semantics", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-soft-fail-"));
+    try {
+      const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+      const result = await withProjectDirOverride(root, () =>
+        execute.handler({
+          language: "shell",
+          code: `node -e "process.stdout.write('softmarker '.repeat(12000))"; exit 1`,
+        }),
+      ) as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).toBe(false);
+      expect(result.content[0]?.text).toContain('No sections matched intent "errors failures exceptions"');
+      expect(result.content[0]?.text).toContain('from "execute:shell"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("ctx_search rejects non-positive and fractional result limits", () => {
     const search = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_search")!;
     const schema = search.config.inputSchema as { safeParse(value: unknown): { success: boolean } };

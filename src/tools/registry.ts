@@ -6,6 +6,12 @@ export interface RegisteredCtxTool {
   handler: (args: Record<string, unknown>, ctx?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
 }
 
+export type RegisterTool = (
+  name: string,
+  config: Record<string, unknown>,
+  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
+) => unknown;
+
 const SERIALIZED_PROJECT_TOOLS = new Set([
   "ctx_execute",
   "ctx_job_start",
@@ -24,11 +30,7 @@ function abortReason(signal: AbortSignal): Error {
 
 export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boolean): {
   tools: RegisteredCtxTool[];
-  register: (
-    name: string,
-    config: Record<string, unknown>,
-    handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-  ) => unknown;
+  register: RegisterTool;
 } {
   const tools: RegisteredCtxTool[] = [];
   const projectToolLocks = new Map<string, Promise<void>>();
@@ -70,11 +72,7 @@ export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boo
     }
   }
 
-  const register = (
-    name: string,
-    config: Record<string, unknown>,
-    handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-  ): unknown => {
+  const register: RegisterTool = (name, config, handler) => {
     const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
       ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => {
           const requestedCwd = typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined;

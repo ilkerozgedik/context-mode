@@ -11,18 +11,59 @@ import {
   LARGE_OUTPUT_THRESHOLD,
 } from "../output-index.js";
 import { checkFilePathDenyPolicy, checkProjectBoundary } from "./security.js";
-
-type RegisterTool = (
-  name: string,
-  config: Record<string, unknown>,
-  handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
-) => unknown;
+import type { RegisterTool } from "./registry.js";
 
 function formatProcessOutput(stdout: string | undefined, stderr: string | undefined, fallback = "(no output)"): string {
   const parts: string[] = [];
   if (stdout) parts.push(stdout);
   if (stderr) parts.push(`stderr:\n${stderr}`);
   return parts.join("\n\n") || fallback;
+}
+
+function formatCompletedExecution(
+  result: { stdout?: string; stderr?: string; exitCode?: number | null },
+  options: { language: string; source: string; echo: string; intent?: string; projectDir?: string },
+) {
+  const { language, source, echo, intent, projectDir } = options;
+  const nonZero = result.exitCode !== 0;
+  const classified = nonZero
+    ? classifyNonZeroExit({
+        language,
+        exitCode: result.exitCode ?? 1,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      })
+    : { isError: false, output: formatProcessOutput(result.stdout, result.stderr) };
+  const { isError, output } = classified;
+  const label = isError ? `${source}:error` : source;
+
+  if (intent?.trim() && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+    return {
+      content: [{ type: "text" as const, text: `${echo}${intentSearch(output, intent, label, undefined, projectDir)}` }],
+      ...(nonZero ? { isError } : {}),
+    };
+  }
+  if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+    if (nonZero) {
+      return {
+        content: [{ type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", label, undefined, projectDir)}` }],
+        isError,
+      };
+    }
+    const indexed = indexStdout(output, source, projectDir);
+    return {
+      ...indexed,
+      content: indexed.content.map((content, index) =>
+        index === 0 && content.type === "text"
+          ? { ...content, text: `${echo}${(content as { text: string }).text}` }
+          : content,
+      ),
+    };
+  }
+  return {
+    content: [{ type: "text" as const, text: `${echo}${output}` }],
+    ...(nonZero ? { isError } : {}),
+  };
 }
 
 export function registerExecutionTools(registerCtxTool: RegisterTool): void {
@@ -97,66 +138,13 @@ ${code}
           };
         }
 
-        if (result.exitCode !== 0) {
-          const { isError, output } = classifyNonZeroExit({
-            language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-          });
-          if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-            return {
-              content: [
-                { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
-              ],
-              isError,
-            };
-          }
-          // Auto-index large error output into FTS5 — no data loss
-          if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-            return {
-              content: [
-                { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
-              ],
-              isError,
-            };
-          }
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${output}` },
-            ],
-            isError,
-          };
-        }
-
-        const output = formatProcessOutput(result.stdout, result.stderr);
-
-        // Intent-driven search: if intent provided and output is large enough
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, intent, `execute:${language}`, undefined, resolveExecutionProjectDir(cwd))}` },
-            ],
-          };
-        }
-
-        // Auto-index large successful output into FTS5 — return pointer, not raw content
-        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          const indexed = indexStdout(output, `execute:${language}`, resolveExecutionProjectDir(cwd));
-          // Prepend echo to the first text content so provenance still surfaces
-          const echoed = {
-            ...indexed,
-            content: indexed.content.map((c, i) =>
-              i === 0 && c.type === "text"
-                ? { ...c, text: `${echo}${(c as { text: string }).text}` }
-                : c,
-            ),
-          };
-          return echoed;
-        }
-
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${output}` },
-          ],
-        };
+        return formatCompletedExecution(result, {
+          language,
+          source: `execute:${language}`,
+          echo,
+          intent,
+          projectDir: resolveExecutionProjectDir(cwd),
+        });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         return {
@@ -307,64 +295,12 @@ ${code}
           };
         }
 
-        if (result.exitCode !== 0) {
-          const { isError, output } = classifyNonZeroExit({
-            language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-          });
-          if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-            return {
-              content: [
-                { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
-              ],
-              isError,
-            };
-          }
-          // Auto-index large error output into FTS5 — no data loss
-          if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-            return {
-              content: [
-                { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
-              ],
-              isError,
-            };
-          }
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${output}` },
-            ],
-            isError,
-          };
-        }
-
-        const output = formatProcessOutput(result.stdout, result.stderr);
-
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, intent, `file:${path}`)}` },
-            ],
-          };
-        }
-
-        // Auto-index large successful output into FTS5 — return pointer, not raw content
-        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          const indexed = indexStdout(output, `file:${path}`);
-          const echoed = {
-            ...indexed,
-            content: indexed.content.map((c, i) =>
-              i === 0 && c.type === "text"
-                ? { ...c, text: `${echo}${(c as { text: string }).text}` }
-                : c,
-            ),
-          };
-          return echoed;
-        }
-
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${output}` },
-          ],
-        };
+        return formatCompletedExecution(result, {
+          language,
+          source: `file:${path}`,
+          echo,
+          intent,
+        });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         return {

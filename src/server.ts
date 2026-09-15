@@ -13,14 +13,14 @@ import { createToolRegistry, type RegisteredCtxTool } from "./tools/registry.js"
 import { registerExecutionTools } from "./tools/execution.js";
 import { registerIndexingTools } from "./tools/indexing.js";
 import { registerFetchTools } from "./tools/fetch.js";
-import { cleanupBatchInstrumentation, registerBatchTools } from "./tools/batch-execute.js";
+import { registerBatchTools } from "./tools/batch-execute.js";
 import { registerDiagnosticTools } from "./tools/diagnostics.js";
 import { executor, jobManager, runtimes } from "./app-runtime.js";
 import { closeStore } from "./project-context.js";
 export { withProjectDirOverride } from "./project-context.js";
 export { isDirectExecution } from "./cli.js";
 export { buildFetchCode, classifyIp } from "./fetch.js";
-export { buildBatchNodeOptionsPrefix, getBatchConcurrencyLimit, resolveConfiguredConcurrency, runBatchCommands } from "./batch.js";
+export { getBatchConcurrencyLimit, resolveConfiguredConcurrency, runBatchCommands } from "./batch.js";
 export { positionsFromHighlight, extractSnippet, formatBatchQueryResults } from "./search-format.js";
 export type { BatchQueryScope } from "./search-format.js";
 
@@ -88,7 +88,6 @@ function cleanupRuntime(): void {
   jobManager.cleanup();
   executor.cleanupProcesses();
   closeStore();
-  cleanupBatchInstrumentation();
 }
 
 async function main() {

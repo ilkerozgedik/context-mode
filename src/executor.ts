@@ -2,6 +2,7 @@ import { spawn, execSync, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { readPositiveEnv } from "./env.js";
 import {
   detectRuntimes,
   buildCommand,
@@ -12,11 +13,6 @@ export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
 
 const isWin = process.platform === "win32";
-
-function readNonNegativeEnv(name: string): number {
-  const value = Number(process.env[name] ?? 0);
-  return Number.isFinite(value) && value > 0 ? value : 0;
-}
 
 export function memoryAdmissionError(meminfo: string, minAvailableMb: number): string | undefined {
   if (minAvailableMb <= 0) return undefined;
@@ -37,7 +33,7 @@ export function resolveForegroundTimeout(
 }
 
 function configuredMemoryAdmissionError(envName: string): string | undefined {
-  const minimum = readNonNegativeEnv(envName);
+  const minimum = readPositiveEnv(envName, 0);
   if (minimum <= 0 || process.platform !== "linux") return undefined;
   try {
     return memoryAdmissionError(readFileSync("/proc/meminfo", "utf8"), minimum);
@@ -297,7 +293,7 @@ export class PolyglotExecutor {
     const { language, code, timeout, cwd: cwdOverride, signal, captureLimitBytes } = opts;
     const admissionError = configuredExecutionAdmissionError();
     if (admissionError) throw new Error(admissionError);
-    const effectiveTimeout = resolveForegroundTimeout(timeout, readNonNegativeEnv("CONTEXT_MODE_MAX_FOREGROUND_MS"));
+    const effectiveTimeout = resolveForegroundTimeout(timeout, readPositiveEnv("CONTEXT_MODE_MAX_FOREGROUND_MS", 0));
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
