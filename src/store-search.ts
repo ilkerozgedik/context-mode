@@ -196,12 +196,13 @@ export class StoreSearchEngine {
     source?: string,
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    mode: "AND" | "OR" = "OR",
   ): SearchResult[] {
     const K = 60; // Standard RRF constant
     const fetchLimit = Math.max(limit * 2, 10);
 
-    const porterResults = this.search(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
-    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
+    const porterResults = this.search(query, fetchLimit, source, mode, contentType, sourceMatchMode);
+    const trigramResults = this.searchTrigram(query, fetchLimit, source, mode, contentType, sourceMatchMode);
 
     const scoreMap = new Map<string, { result: SearchResult; score: number }>();
     const key = (r: SearchResult) => `${r.source}::${r.title}`;
@@ -295,15 +296,19 @@ export class StoreSearchEngine {
   ): SearchResult[] {
     this.#refresh();
 
-    const rrfResults = this.rrfSearch(query, limit, source, contentType, sourceMatchMode);
-    if (rrfResults.length > 0) {
-      const reranked = this.applyProximityReranking(rrfResults, query);
-      return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
+    // Prefer precision: if any chunk matches all meaningful terms, do not
+    // spend context on partial matches. Relax to OR only when strict retrieval
+    // has no result, preserving recall for exploratory queries.
+    for (const mode of ["AND", "OR"] as const) {
+      const rrfResults = this.rrfSearch(query, limit, source, contentType, sourceMatchMode, mode);
+      if (rrfResults.length > 0) {
+        const reranked = this.applyProximityReranking(rrfResults, query);
+        return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
+      }
     }
 
-    // Step 2: Fuzzy correction → RRF re-run
-    // Skip stopwords — they'll be filtered by sanitizeQuery anyway, and each
-    // fuzzyCorrect call hits the vocab DB + runs levenshtein comparisons.
+    // Fuzzy correction is the final fallback; keep the same strict-then-relaxed
+    // order so typo recovery does not reintroduce noisy partial matches first.
     const words = query
       .toLowerCase()
       .trim()
@@ -314,10 +319,12 @@ export class StoreSearchEngine {
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
-      if (fuzzyResults.length > 0) {
-        const reranked = this.applyProximityReranking(fuzzyResults, correctedQuery);
-        return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
+      for (const mode of ["AND", "OR"] as const) {
+        const fuzzyResults = this.rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode, mode);
+        if (fuzzyResults.length > 0) {
+          const reranked = this.applyProximityReranking(fuzzyResults, correctedQuery);
+          return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
+        }
       }
     }
 

@@ -131,6 +131,25 @@ describe("persistent core", () => {
     }
   });
 
+  test("prefers chunks matching all query terms before relaxed partial matches", () => {
+    const dir = tempDir();
+    const store = new ContentStore(join(dir, "precision.db"));
+    try {
+      store.index({ content: "# Exact\n\nalpha target together", source: "exact" });
+      store.index({ content: "# Partial\n\nalpha only", source: "partial" });
+
+      const exact = store.searchWithFallback("alpha target", 2);
+      expect(exact).toHaveLength(1);
+      expect(exact[0]?.source).toBe("exact");
+
+      const relaxed = store.searchWithFallback("alpha missing", 2);
+      expect(relaxed.length).toBeGreaterThan(0);
+      expect(relaxed.some((result) => result.source === "partial")).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
 
 });
 

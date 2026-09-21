@@ -1,4 +1,5 @@
 import { getProjectDir, getStore } from "./project-context.js";
+import { extractSnippet } from "./search-format.js";
 
 export const INDEX_OUTPUT_CAP_BYTES = 4 * 1024 * 1024;
 export const INTENT_SEARCH_THRESHOLD = 5_000;
@@ -41,7 +42,7 @@ export function intentSearch(
   stdout: string,
   intent: string,
   source: string,
-  maxResults: number = 5,
+  maxResults: number = 2,
   projectDir: string = getProjectDir(),
 ): string {
   const indexable = capIndexableOutput(stdout);
@@ -50,27 +51,16 @@ export function intentSearch(
   const persistent = getStore(projectDir);
   const indexed = persistent.indexPlainText(indexable.text, source, undefined);
   const results = persistent.searchWithFallback(intent, maxResults, source);
-  const distinctiveTerms = persistent.getDistinctiveTerms(indexed.sourceId);
 
   if (results.length === 0) {
-    const lines = [
-      `Indexed ${indexed.totalChunks} sections from "${source}" into knowledge base.`,
-      `No sections matched intent "${intent}" in ${totalLines}-line output (${(totalBytes / 1024).toFixed(1)}KB).`,
-    ];
-    if (distinctiveTerms.length > 0) lines.push("", `Searchable terms: ${distinctiveTerms.join(", ")}`);
-    lines.push("", "Use ctx_search(queries: [...]) to explore the indexed content.");
-    return lines.join("\n");
+    return `No sections matched intent "${intent}" in ${totalLines}-line output (${(totalBytes / 1024).toFixed(1)}KB); indexed ${indexed.totalChunks} sections from "${source}".`;
   }
 
   const lines = [
-    `Indexed ${indexed.totalChunks} sections from "${source}" into knowledge base.`,
-    `${results.length} sections matched "${intent}" (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB):`,
-    "",
+    `Indexed ${indexed.totalChunks} sections from "${source}"; ${results.length} matched "${intent}":`,
   ];
   for (const result of results) {
-    lines.push(`  - ${result.title}: ${result.content.split("\n")[0].slice(0, 120)}`);
+    lines.push("", `### ${result.title}`, extractSnippet(result.content, intent, 700, result.highlighted));
   }
-  if (distinctiveTerms.length > 0) lines.push("", `Searchable terms: ${distinctiveTerms.join(", ")}`);
-  lines.push("", "Use ctx_search(queries: [...]) to retrieve full content of any section.");
   return lines.join("\n");
 }

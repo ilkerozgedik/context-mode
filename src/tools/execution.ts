@@ -36,32 +36,25 @@ function formatCompletedExecution(
     : { isError: false, output: formatProcessOutput(result.stdout, result.stderr) };
   const { isError, output } = classified;
   const label = isError ? `${source}:error` : source;
+  const prefix = nonZero ? echo : "";
 
   if (intent?.trim() && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
     return {
-      content: [{ type: "text" as const, text: `${echo}${intentSearch(output, intent, label, undefined, projectDir)}` }],
+      content: [{ type: "text" as const, text: `${prefix}${intentSearch(output, intent, label, undefined, projectDir)}` }],
       ...(nonZero ? { isError } : {}),
     };
   }
   if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
     if (nonZero) {
       return {
-        content: [{ type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", label, undefined, projectDir)}` }],
+        content: [{ type: "text" as const, text: `${prefix}${intentSearch(output, "errors failures exceptions", label, undefined, projectDir)}` }],
         isError,
       };
     }
-    const indexed = indexStdout(output, source, projectDir);
-    return {
-      ...indexed,
-      content: indexed.content.map((content, index) =>
-        index === 0 && content.type === "text"
-          ? { ...content, text: `${echo}${(content as { text: string }).text}` }
-          : content,
-      ),
-    };
+    return indexStdout(output, source, projectDir);
   }
   return {
-    content: [{ type: "text" as const, text: `${echo}${output}` }],
+    content: [{ type: "text" as const, text: `${prefix}${output}` }],
     ...(nonZero ? { isError } : {}),
   };
 }
@@ -84,26 +77,26 @@ export function registerExecutionTools(registerCtxTool: RegisterTool): void {
         idempotentHint: false,
         openWorldHint: true,
       },
-      description: "Run code as a child process with the MCP server OS permissions. Print only findings that should enter context; use ctx_batch_execute for related commands.",
+      description: "Run code with MCP server OS permissions; print only useful output.",
       inputSchema: z.strictObject({
         language: z
   .enum(["javascript", "python", "shell"])
-          .describe("Runtime language"),
+          .describe("Runtime."),
         code: z
           .string()
-          .describe("Code to execute; print only the result that should enter context."),
+          .describe("Code to run."),
         timeout: z
           .coerce.number()
           .optional()
-          .describe("Max execution time in ms; omit to use the MCP host timeout."),
+          .describe("Timeout ms."),
         cwd: z
           .string()
           .optional()
-          .describe("Optional working directory for shell commands."),
+          .describe("Working directory."),
         intent: z
           .string()
           .optional()
-          .describe("Terms to match when large output is indexed."),
+          .describe("Large-output search terms."),
       }),
     },
     async ({ language, code, timeout, cwd, intent }, ctx) => {
@@ -165,11 +158,11 @@ ${code}
     {
       title: "Start resource-limited async job (uses MCP server OS permissions)",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-      description: "Start one long-running shell job under a resource-limited systemd user service. Returns immediately with a job receipt; runs with the MCP server OS permissions.",
+      description: "Run a long shell job with MCP server OS permissions; returns a receipt.",
       inputSchema: z.object({
         command: z.string().min(1).describe("Shell command to run."),
-        cwd: z.string().optional().describe("Working directory; defaults to the configured project directory."),
-        expected_artifacts: z.array(z.string().min(1)).max(16).optional().describe("Optional artifact paths inside cwd to report when present."),
+        cwd: z.string().optional().describe("Working directory."),
+        expected_artifacts: z.array(z.string().min(1)).max(16).optional().describe("Artifact paths under cwd."),
       }),
     },
     async ({ command, cwd, expected_artifacts }) => {
@@ -190,7 +183,7 @@ ${code}
     {
       title: "Read async job status",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      description: "Read the current receipt for a previously started async job.",
+      description: "Read async job receipt.",
       inputSchema: z.object({ job_id: z.string().min(1) }),
     },
     async ({ job_id }) => {
@@ -207,7 +200,7 @@ ${code}
     {
       title: "Cancel async job",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      description: "Cancel the active async job and return its final receipt.",
+      description: "Cancel async job; return final receipt.",
       inputSchema: z.object({ job_id: z.string().min(1) }),
     },
     async ({ job_id }) => {
@@ -237,26 +230,26 @@ ${code}
         idempotentHint: false,
         openWorldHint: true,
       },
-      description: "Analyze a selected project file without loading it into context. Code receives FILE_CONTENT and runs with the MCP server OS permissions; only printed output is returned.",
+      description: "Run code over a file with MCP server OS permissions; FILE_CONTENT is available.",
       inputSchema: z.object({
-        cwd: z.string().optional().describe("Project directory used to scope paths and the persistent index."),
+        cwd: z.string().optional().describe("Project scope."),
         path: z
           .string()
-          .describe("Absolute file path or relative to project root"),
+          .describe("Project file path."),
         language: z
   .enum(["javascript", "python", "shell"])
-          .describe("Runtime language"),
+          .describe("Runtime."),
         code: z
           .string()
-          .describe("Code that reads FILE_CONTENT and prints the result to return."),
+          .describe("Code using FILE_CONTENT."),
         timeout: z
           .coerce.number()
           .optional()
-          .describe("Max execution time in ms; omit to use the MCP host timeout."),
+          .describe("Timeout ms."),
         intent: z
           .string()
           .optional()
-          .describe("Terms to match when large output is indexed."),
+          .describe("Large-output search terms."),
       }),
     },
     async ({ path, language, code, timeout, intent }, ctx) => {

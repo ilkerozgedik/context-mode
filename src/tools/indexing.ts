@@ -23,44 +23,44 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
         idempotentHint: false,
         openWorldHint: false,
       },
-      description: "Index text, files, or directories into the persistent knowledge base for later ctx_search retrieval.",
+      description: "Index content for ctx_search.",
       inputSchema: z.object({
-        cwd: z.string().optional().describe("Project directory used to scope paths and the persistent index."),
+        cwd: z.string().optional().describe("Project scope."),
         content: z
           .string()
           .min(1)
           .optional()
           .describe(
-            "Small inline text/markdown to index. Use path for files, directories, or large content saved to disk; provide content OR path, not both.",
+            "Inline content; exclusive with path.",
           ),
         path: z
           .string()
           .min(1)
           .optional()
-          .describe("File or directory path to index; preferred for files, directories, or large content saved to disk. Provide path OR content, not both."),
+          .describe("File or directory; exclusive with content."),
         source: z
           .string()
           .optional()
           .describe(
-            "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
+            "Source label.",
           ),
         include: z.array(z.string()).optional().describe(
-          "Directory-only: glob patterns to include (default: all matching extensions).",
+          "Directory include globs.",
         ),
         exclude: z.array(z.string()).optional().describe(
-          "Directory globs to exclude; common build and vendor directories are skipped by default.",
+          "Directory exclude globs.",
         ),
         maxDepth: z.number().int().min(0).optional().describe(
-          "Directory-only: max recursion depth from root (default: 5).",
+          "Directory depth (default 5).",
         ),
         maxFiles: z.number().int().min(1).optional().describe(
-          "Directory-only: hard cap on files indexed (default: 200) — FTS5 blow-up guard.",
+          "Directory file cap (default 200).",
         ),
         extensions: z.array(z.string()).optional().describe(
-          "Allowed file extensions when indexing a directory.",
+          "Directory extensions.",
         ),
         respectGitignore: z.boolean().optional().describe(
-          "Directory-only: apply nearest .gitignore (default: true).",
+          "Honor .gitignore (default true).",
         ),
         followSymlinks: z.boolean().optional().describe(
           "Directory-only: follow directory symlinks (default: false — cycle hazard + escape risk).",
@@ -215,13 +215,13 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
     {
       title: "Search Indexed Content",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      description: "Search indexed content. Batch related questions in queries; use source to narrow retrieval.",
+      description: "Search indexed content; batch related queries.",
       inputSchema: z.object({
-        cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
-        queries: z.array(z.string()).min(1).describe("Array of search queries. Batch ALL questions in one call."),
-        limit: z.coerce.number().int().min(1).optional().default(3).describe("Results per query (default: 3)"),
-        source: z.string().optional().describe("Filter to a specific indexed source (partial match)."),
-        contentType: z.enum(["code", "prose"]).optional().describe("Filter results by content type: 'code' or 'prose'."),
+        cwd: z.string().optional().describe("Project scope."),
+        queries: z.array(z.string()).min(1).describe("Queries; batch related questions."),
+        limit: z.coerce.number().int().min(1).optional().default(3).describe("Results/query (default 3)."),
+        source: z.string().optional().describe("Source filter (partial match)."),
+        contentType: z.enum(["code", "prose"]).optional().describe("Content type."),
       }),
     },
     async ({ queries, limit = 3, source, contentType }) => {

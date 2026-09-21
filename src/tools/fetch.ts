@@ -22,15 +22,15 @@ export function registerFetchTools(registerCtxTool: RegisterTool): void {
         idempotentHint: false,
         openWorldHint: true,
       },
-      description: "Fetch and index URL content server-side so raw pages stay out of context. Use ctx_search for follow-up retrieval.",
+      description: "Fetch URLs server-side, index content, return compact previews.",
       inputSchema: z.strictObject({
-        cwd: z.string().optional().describe("Project directory used to scope the persistent index."),
+        cwd: z.string().optional().describe("Project scope."),
         requests: z.array(
           z.object({
-            url: z.string().describe("URL to fetch"),
-            source: z.string().optional().describe("Label for this URL's indexed content"),
+            url: z.string().describe("URL."),
+            source: z.string().optional().describe("Source label."),
           }),
-        ).min(1).describe("URLs to fetch and index."),
+        ).min(1).describe("URLs."),
         concurrency: z
           .coerce.number()
           .int()
@@ -38,17 +38,17 @@ export function registerFetchTools(registerCtxTool: RegisterTool): void {
           .max(8)
           .optional()
           .default(1)
-          .describe("Parallel URL fetches, 1-8; indexing remains serial."),
+          .describe("Parallel fetches 1-8."),
         force: z
           .boolean()
           .optional()
-          .describe("Skip cache and re-fetch even if content was recently indexed"),
+          .describe("Bypass cache."),
         ttl: z
           .coerce.number()
           .int()
           .min(0)
           .optional()
-          .describe("Cache TTL in ms; 0 bypasses cache."),
+          .describe("Cache TTL ms; 0 bypasses."),
       }),
     },
     async ({ requests, concurrency, force, ttl }, ctx) => {

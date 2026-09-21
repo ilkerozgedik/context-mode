@@ -132,6 +132,50 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({ language: "shell", code: "echo should-not-run", background: true }).success).toBe(false);
   });
 
+  test("successful ctx_execute returns output without repeating submitted code", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-compact-execute-"));
+    try {
+      const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+      const result = await withProjectDirOverride(root, () =>
+        execute.handler({
+          language: "shell",
+          code: "printf compact-success-marker",
+          cwd: root,
+        }),
+      ) as { isError?: boolean; content: Array<{ text: string }> };
+      const text = result.content[0]?.text ?? "";
+      expect(result.isError).not.toBe(true);
+      expect(text).toBe("compact-success-marker");
+      expect(text).not.toContain("printf compact-success-marker");
+      expect(text).not.toContain("```shell");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("large intent execution returns the matching snippet directly", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-intent-snippet-"));
+    try {
+      const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute")!;
+      const result = await withProjectDirOverride(root, () =>
+        execute.handler({
+          language: "python",
+          code: "for i in range(1200): print(('INTENT_NEEDLE direct evidence ' if i == 777 else 'ordinary payload ') + str(i))",
+          intent: "INTENT_NEEDLE direct evidence",
+          cwd: root,
+        }),
+      ) as { isError?: boolean; content: Array<{ text: string }> };
+      const text = result.content[0]?.text ?? "";
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain("INTENT_NEEDLE direct evidence 777");
+      expect(text).not.toContain("Use ctx_search");
+      expect(text).not.toContain("```python");
+      expect(text.length).toBeLessThan(2000);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("large shell soft-fail output keeps non-error intent-search semantics", async () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-soft-fail-"));
     try {

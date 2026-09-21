@@ -36,13 +36,7 @@ export function resolveConfiguredConcurrency(requested: number): number {
 }
 
 
-const COMMAND_ECHO_MAX = 500;
 const CODE_ECHO_MAX = 2000;
-
-export function truncateCommandForEcho(command: string): string {
-  const cleaned = command.replace(/\s+/g, " ").trim();
-  return cleaned.length <= COMMAND_ECHO_MAX ? cleaned : cleaned.slice(0, COMMAND_ECHO_MAX) + "…";
-}
 
 function truncateCodeForEcho(code: string): string {
   return code.length <= CODE_ECHO_MAX ? code : code.slice(0, CODE_ECHO_MAX) + "\n… (truncated)";
@@ -53,9 +47,9 @@ export function buildExecuteEcho(language: string, code: string, path?: string):
   return `${header}\`\`\`${language}\n${truncateCodeForEcho(code)}\n\`\`\`\n\n`;
 }
 
-function formatCommandOutput(label: string, command: string, raw: string): string {
+function formatCommandOutput(label: string, raw: string): string {
   const output = raw || "(no output)";
-  return `# ${label}\n\n$ ${truncateCommandForEcho(command)}\n\n${output}\n`;
+  return `# ${label}\n\n${output}\n`;
 }
 
 function combineExecOutput(result: { stdout?: string; stderr?: string }): string {
@@ -94,7 +88,7 @@ export async function runBatchCommands(
       const result = await executor.execute({
         language: "shell", code: cmd.command, timeout: perCmdTimeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
-      outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result)));
+      outputs.push(formatCommandOutput(cmd.label, combineExecOutput(result)));
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -111,7 +105,7 @@ export async function runBatchCommands(
       const result = await executor.execute({
         language: "shell", code: cmd.command, timeout, cwd, signal, captureLimitBytes: BATCH_COMMAND_CAPTURE_BYTES,
       });
-      const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result));
+      const formatted = formatCommandOutput(cmd.label, combineExecOutput(result));
       const output = result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${result.timeoutMs ?? timeout ?? "?"}ms)\n`
         : formatted;

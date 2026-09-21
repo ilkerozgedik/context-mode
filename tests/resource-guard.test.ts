@@ -319,8 +319,46 @@ describe("resource guards", () => {
       expect(result.isError).not.toBe(true);
       expect(text).toContain("compound-ok");
       expect(text).not.toContain("syntax error");
+      expect(text).not.toContain("## Commands");
+      expect(text).not.toContain("## Indexed Sections");
+      expect(text).not.toContain("if true; then printf compound-ok; fi");
     } finally {
       await purge!.handler({ confirm: true, cwd: root });
+      if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
+      else process.env.CONTEXT_MODE_DIR = previousStorage;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  test("large batch response stays compact instead of listing every indexed chunk", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-batch-compact-"));
+    const storage = mkdtempSync(join(tmpdir(), "context-mode-batch-compact-storage-"));
+    const previousStorage = process.env.CONTEXT_MODE_DIR;
+    process.env.CONTEXT_MODE_DIR = storage;
+    const batch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_batch_execute")!;
+    const purge = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_purge")!;
+    try {
+      const result = await batch.handler({
+        commands: [{
+          label: "large-log",
+          command: "node -e \"for(let i=0;i<12000;i++) console.log(i===7777?'BATCH_NEEDLE direct evidence '+i:'ordinary payload '+i)\"",
+        }],
+        queries: ["BATCH_NEEDLE direct evidence"],
+        timeout: 10000,
+        concurrency: 1,
+        query_scope: "batch",
+        cwd: root,
+      }) as { isError?: boolean; content: Array<{ text: string }> };
+      const text = result.content.map((part) => part.text).join("\n");
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain("BATCH_NEEDLE direct evidence 7777");
+      expect(text).not.toContain("## Commands");
+      expect(text).not.toContain("## Indexed Sections");
+      expect(text).not.toContain("Searchable terms for follow-up");
+      expect(text.length).toBeLessThan(3000);
+    } finally {
+      await purge.handler({ confirm: true, cwd: root });
       if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
       else process.env.CONTEXT_MODE_DIR = previousStorage;
       rmSync(root, { recursive: true, force: true });

@@ -122,7 +122,7 @@ export function formatBatchQueryResults(
   store: ContentStore,
   queries: string[],
   source: string,
-  maxOutput = 80 * 1024,
+  maxOutput = 32 * 1024,
   scope: BatchQueryScope = "batch",
 ): string[] {
   const sections: string[] = [];
@@ -140,12 +140,12 @@ export function formatBatchQueryResults(
       continue;
     }
 
-    const results = store.searchWithFallback(query, 3, searchSource, undefined, "exact");
+    const results = store.searchWithFallback(query, 2, searchSource, undefined, "exact");
     sections.push(`## ${query}`);
     sections.push("");
     if (results.length > 0) {
       for (const result of results) {
-        const snippet = extractSnippet(result.content, query, 3000, result.highlighted);
+        const snippet = extractSnippet(result.content, query, 1200, result.highlighted);
         sections.push(`### ${result.title}`);
         sections.push(snippet);
         sections.push("");
@@ -156,12 +156,6 @@ export function formatBatchQueryResults(
 
     sections.push("No matching sections found.");
     sections.push("");
-  }
-
-  if (scope === "global") {
-    sections.push(`\n> **Scope:** Queries searched the entire persistent index (query_scope: "global").`);
-  } else {
-    sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`ctx_search(queries: [...])\` or call ctx_batch_execute with \`query_scope: "global"\`.`);
   }
 
   return sections;

@@ -15,7 +15,7 @@ export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: 
     {
       title: "Run Diagnostics",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      description: "Diagnose context-mode and return a plain-text [OK]/[WARN]/[FAIL] status report.",
+      description: "Context-mode health report.",
       inputSchema: z.object({}),
     },
     async () => {
@@ -83,10 +83,10 @@ export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: 
     {
       title: "Purge Knowledge Base",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      description: "Permanently delete indexed content for the current project. Requires confirm:true.",
+      description: "Delete this project's index; confirm:true required.",
       inputSchema: z.object({
-        cwd: z.string().optional().describe("Project directory whose knowledge base should be purged."),
-        confirm: z.boolean().describe("MUST be true. Destructive operation; false returns 'purge cancelled'."),
+        cwd: z.string().optional().describe("Project scope."),
+        confirm: z.boolean().describe("Must be true."),
       }),
     },
     async ({ confirm }) => {

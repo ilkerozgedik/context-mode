@@ -3,7 +3,6 @@ import { executor } from "../app-runtime.js";
 import {
   getBatchConcurrencyLimit,
   runBatchCommands,
-  truncateCommandForEcho,
 } from "../batch.js";
 import { capIndexableOutput, INDEX_OUTPUT_CAP_BYTES } from "../output-index.js";
 import { getStore, resolveExecutionProjectDir } from "../project-context.js";
@@ -26,7 +25,7 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
         idempotentHint: false,
         openWorldHint: true,
       },
-      description: "Run related shell commands with the MCP server OS permissions, index their output, and return query matches. Use for related or large-output commands.",
+      description: "Run shell commands with MCP server OS permissions; index output and return query matches.",
       inputSchema: z.object({
         commands: z.array(
             z.object({
@@ -42,14 +41,14 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
           )
           .min(1)
           .max(8)
-          .describe("Commands to run; labels become indexed section headers (max 8)."),
+          .describe("1-8 commands."),
         queries: z.array(z.string())
           .min(1)
-          .describe("Queries to extract from indexed batch output."),
+          .describe("Queries over output."),
         timeout: z
           .coerce.number()
           .optional()
-          .describe("Max execution time in ms per batch or command."),
+          .describe("Timeout ms."),
         concurrency: z
           .coerce.number()
           .int()
@@ -57,16 +56,16 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
           .max(getBatchConcurrencyLimit())
           .optional()
           .default(1)
-          .describe(`Parallel commands, 1-${getBatchConcurrencyLimit()}; use 1 for stateful or CPU-bound work.`),
+          .describe(`Parallelism 1-${getBatchConcurrencyLimit()}.`),
         cwd: z
           .string()
           .optional()
-          .describe("Optional working directory for all shell commands in this batch."),
+          .describe("Working directory."),
         query_scope: z
           .enum(["batch", "global"])
           .optional()
           .default("batch")
-          .describe("'batch' searches this call; 'global' searches the full index."),
+          .describe("batch=this output; global=all indexed."),
       }),
     },
     async ({ commands, queries, timeout, concurrency, cwd, query_scope }, ctx) => {
@@ -112,48 +111,17 @@ export function registerBatchTools(registerCtxTool: RegisterTool): void {
           .slice(0, 80)}`;
         const indexed = store.index({ content: indexable.text, source });
 
-        // Commands inventory — list what the agent actually ran so the
-        // response itself documents intent, not just per-section echoes.
-        // Placed before "## Indexed Sections" so it scans top-down with
-        // the human asking "what just happened" (Issues #717 + #736).
-        const commandsInventory: string[] = ["## Commands", ""];
-        for (const c of commands) {
-          commandsInventory.push(`- ${c.label}: \`${truncateCommandForEcho(c.command)}\``);
-        }
-
-        // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
-        const allSections = store.getChunksBySource(indexed.sourceId);
-        const inventory: string[] = ["## Indexed Sections", ""];
-        const sectionTitles: string[] = [];
-        for (const s of allSections) {
-          const bytes = Buffer.byteLength(s.content);
-          inventory.push(`- ${s.title} (${(bytes / 1024).toFixed(1)}KB)`);
-          sectionTitles.push(s.title);
-        }
-
         // Run all search queries — default scope is batch-local.
         // When the caller passes query_scope: "global", searches reach the entire
         // persistent index in the same round trip. Cross-source search remains
         // available via explicit ctx_search() as well.
         const queryResults = formatBatchQueryResults(store, queries, source, undefined, query_scope);
 
-        // Get searchable terms for edge cases where follow-up is needed
-        const distinctiveTerms = store.getDistinctiveTerms
-          ? store.getDistinctiveTerms(indexed.sourceId)
-          : [];
-
         const output = [
           `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
             `Indexed ${indexed.totalChunks} sections${indexable.truncated ? ` (output capped at ${(INDEX_OUTPUT_CAP_BYTES / 1024 / 1024).toFixed(0)}MB before indexing)` : ""}. Searched ${queries.length} queries.`,
           "",
-          ...commandsInventory,
-          "",
-          ...inventory,
-          "",
           ...queryResults,
-          distinctiveTerms.length > 0
-            ? `\nSearchable terms for follow-up: ${distinctiveTerms.join(", ")}`
-            : "",
         ].join("\n");
 
         return {
