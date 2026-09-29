@@ -188,6 +188,7 @@ describe("async jobs", () => {
     expect(args).toContain("--property=UMask=0077");
     expect(args).toContain("--setenv=LANG=en_US.UTF-8");
     expect(args).toContain("--setenv=NO_COLOR=1");
+    expect(args).toContain("--setenv=TMPDIR=/tmp");
     expect(args).toContain("--pipe");
     expect(args).not.toContain("--collect");
     expect(args.slice(-3)).toEqual(["/bin/bash", "-c", "godot --headless --export-debug Android app.apk"]);

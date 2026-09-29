@@ -110,6 +110,7 @@ export function buildSystemdRunArgs(opts: SystemdRunOptions): string[] {
     "--property=UMask=0077",
     `--setenv=PATH=${opts.path}`,
     `--setenv=HOME=${opts.home}`,
+    "--setenv=TMPDIR=/tmp",
     "--setenv=LANG=en_US.UTF-8",
     "--setenv=NO_COLOR=1",
     "/bin/bash",
