@@ -1,22 +1,10 @@
 import { getProjectDir, getStore } from "./project-context.js";
 import { extractSnippet } from "./search-format.js";
+import { byteCappedPrefix } from "./store-chunking.js";
 
 export const INDEX_OUTPUT_CAP_BYTES = 4 * 1024 * 1024;
 export const INTENT_SEARCH_THRESHOLD = 5_000;
 export const LARGE_OUTPUT_THRESHOLD = 102_400;
-
-function byteCappedPrefix(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text) <= maxBytes) return text;
-  let bytes = 0;
-  let end = 0;
-  for (const char of text) {
-    const charBytes = Buffer.byteLength(char);
-    if (bytes + charBytes > maxBytes) break;
-    bytes += charBytes;
-    end += char.length;
-  }
-  return text.slice(0, end);
-}
 
 export function capIndexableOutput(text: string): { text: string; truncated: boolean } {
   const capped = byteCappedPrefix(text, INDEX_OUTPUT_CAP_BYTES);
