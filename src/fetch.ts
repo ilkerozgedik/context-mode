@@ -484,6 +484,12 @@ export function classifyIp(rawIp: string): "block" | "private" | "public" {
     // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — recurse through IPv4 classifier
     const v4MappedMatch = lower.match(/^::ffff:([\d.]+)$/);
     if (v4MappedMatch) return classifyIp(v4MappedMatch[1]);
+    // WHATWG URL parsing normalizes mapped addresses into hexadecimal pairs.
+    const hexMapped = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMapped) {
+      const value = (parseInt(hexMapped[1], 16) * 0x10000 + parseInt(hexMapped[2], 16)) >>> 0;
+      return classifyIp(`${value >>> 24}.${(value >>> 16) & 255}.${(value >>> 8) & 255}.${value & 255}`);
+    }
     // Hard-block
     if (lower === "::") return "block"; // unspecified
     if (lower.startsWith("fe8") || lower.startsWith("fe9") ||
