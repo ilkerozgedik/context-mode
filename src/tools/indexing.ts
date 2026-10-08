@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { z } from "zod";
 import { readPositiveEnv } from "../env.js";
-import { getProjectDir, getStore, resolveProjectPath } from "../project-context.js";
+import { getProjectDir, getStore, resolveProjectPath, resolveProjectScope } from "../project-context.js";
 import { extractSnippet } from "../search-format.js";
 import { checkFilePathDenyPolicy, checkProjectBoundary, createPerFileReadDeny } from "./security.js";
 import type { RegisterTool } from "./registry.js";
@@ -193,20 +193,20 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
   const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
   const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3);
   const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8);
-  let searchWindowStart = 0;
-  let searchCallCount = 0;
+  const searchWindows = new Map<string, { start: number; count: number }>();
 
-  function recordSearch(now: number): { count: number; windowStart: number; blocked: boolean; softCapped: boolean } {
-    if (!searchWindowStart || now - searchWindowStart > SEARCH_WINDOW_MS) {
-      searchWindowStart = now;
-      searchCallCount = 0;
+  function recordSearch(now: number, project: string): { count: number; windowStart: number; blocked: boolean; softCapped: boolean } {
+    for (const [key, window] of searchWindows) {
+      if (now - window.start >= SEARCH_WINDOW_MS) searchWindows.delete(key);
     }
-    searchCallCount++;
+    const window = searchWindows.get(project) ?? { start: now, count: 0 };
+    window.count++;
+    searchWindows.set(project, window);
     return {
-      count: searchCallCount,
-      windowStart: searchWindowStart,
-      blocked: searchCallCount > SEARCH_BLOCK_AFTER,
-      softCapped: searchCallCount > SEARCH_MAX_RESULTS_AFTER,
+      count: window.count,
+      windowStart: window.start,
+      blocked: window.count > SEARCH_BLOCK_AFTER,
+      softCapped: window.count > SEARCH_MAX_RESULTS_AFTER,
     };
   }
 
@@ -238,7 +238,7 @@ export function registerIndexingTools(registerCtxTool: RegisterTool): void {
         }
 
         const now = Date.now();
-        const flood = recordSearch(now);
+        const flood = recordSearch(now, resolveProjectScope(getProjectDir()));
         if (flood.blocked) {
           return {
             content: [{
