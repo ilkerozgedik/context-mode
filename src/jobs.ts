@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve, sep } from "node:path";
@@ -59,7 +59,8 @@ interface JobRecord {
   expectedArtifacts: string[];
   handle: JobHandle;
   done: Promise<void>;
-  cancelRequested: boolean;
+  cancelConfirmed: boolean;
+  cancelAttempt: Promise<void> | null;
 }
 
 
@@ -244,23 +245,32 @@ export class SystemdJobRunner implements JobRunner {
       done,
       snapshot: () => ({ stdoutTail: stdout.toString("utf8"), stderrTail: stderr.toString("utf8") }),
       cancel: async () => {
+        let stopped = false;
         try {
           execFileSync("/usr/bin/systemctl", ["--user", "stop", `${opts.unit}.service`], {
             env,
             stdio: "ignore",
             timeout: 10_000,
           });
+          stopped = true;
         } catch {
-          killClient(proc);
+          // A not-yet-created unit must not count as a cancelled job.
+        }
+        if (!stopped) throw new Error(`systemd could not stop ${opts.unit}.service`);
+        let state: string;
+        try {
+          state = execFileSync("/usr/bin/systemctl", [
+            "--user", "show", `${opts.unit}.service`, "--property=ActiveState", "--value",
+          ], { env, encoding: "utf8", timeout: 10_000 }).trim();
+        } catch {
+          throw new Error(`Cannot verify cancellation of ${opts.unit}.service`);
+        }
+        if (state !== "inactive" && state !== "failed") {
+          throw new Error(`Cancellation not confirmed for ${opts.unit}.service (state: ${state || "unknown"})`);
         }
       },
     };
   }
-}
-
-function killClient(proc: ChildProcess): void {
-  if (!proc.pid) return;
-  try { process.kill(-proc.pid, "SIGKILL"); } catch { /* already gone */ }
 }
 
 export function classifyJobTermination(
@@ -353,17 +363,20 @@ export class JobManager {
       expectedArtifacts,
       handle,
       done: Promise.resolve(),
-      cancelRequested: false,
+      cancelConfirmed: false,
+      cancelAttempt: null,
     };
     this.#activeIds.add(id);
     this.#jobs.set(id, record);
     console.error(`[context-mode] job started id=${id} unit=${unit} project=${projectScope}`);
-    record.done = handle.done.then((completion) => {
+    record.done = handle.done.then(async (completion) => {
+      // The client may close while systemd stop is still being verified.
+      await record.cancelAttempt?.catch(() => {});
       record.exitCode = completion.exitCode;
       record.stdoutTail = completion.stdoutTail;
       record.stderrTail = completion.stderrTail;
       record.finishedAt = new Date().toISOString();
-      const classified = classifyJobTermination(completion, record.cancelRequested);
+      const classified = classifyJobTermination(completion, record.cancelConfirmed);
       record.status = classified.status;
       record.terminationReason = classified.reason;
       this.#activeIds.delete(id);
@@ -384,9 +397,13 @@ export class JobManager {
     const record = this.#jobs.get(jobId);
     if (!record) throw new Error(`unknown job_id: ${jobId}`);
     if (record.status !== "running") return this.#receipt(record);
-    record.cancelRequested = true;
     console.error(`[context-mode] job cancel id=${jobId}`);
-    await record.handle.cancel();
+    try {
+      await this.#requestCancel(record);
+    } catch (error) {
+      record.cancelAttempt = null;
+      throw error;
+    }
     await record.done;
     return this.#receipt(record);
   }
@@ -395,9 +412,18 @@ export class JobManager {
     for (const id of this.#activeIds) {
       const record = this.#jobs.get(id);
       if (!record || record.status !== "running") continue;
-      record.cancelRequested = true;
-      void record.handle.cancel();
+      void this.#requestCancel(record).catch((error: unknown) => {
+        record.cancelAttempt = null;
+        console.error(`[context-mode] job cleanup failed id=${id}: ${String(error)}`);
+      });
     }
+  }
+
+  #requestCancel(record: JobRecord): Promise<void> {
+    record.cancelAttempt ??= record.handle.cancel().then(() => {
+      record.cancelConfirmed = true;
+    });
+    return record.cancelAttempt;
   }
 
   #resolveArtifact(cwd: string, artifact: string): string {

@@ -115,6 +115,50 @@ describe("async jobs", () => {
     }
   });
 
+  test("failed cancellation does not mark an active job as cancelled", async () => {
+    const runner = new FakeRunner();
+    const originalStart = runner.start.bind(runner);
+    runner.start = () => ({
+      ...originalStart(),
+      cancel: async () => { throw new Error("systemd unit remains active"); },
+    });
+    const manager = new JobManager({ runner });
+    const root = mkdtempSync(join(tmpdir(), "context-mode-job-cancel-fail-"));
+    try {
+      const started = manager.start({ command: "sleep", cwd: root });
+      await expect(manager.cancel(started.jobId)).rejects.toThrow("unit remains active");
+      expect(manager.status(started.jobId).status).toBe("running");
+      runner.completions[0]({ exitCode: 0, stdoutTail: "done", stderrTail: "" });
+      await started.done;
+      expect(manager.status(started.jobId).status).toBe("succeeded");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("completion racing a failed stop is not reported as cancelled", async () => {
+    const runner = new FakeRunner();
+    const originalStart = runner.start.bind(runner);
+    let rejectStop!: (error: Error) => void;
+    runner.start = () => ({
+      ...originalStart(),
+      cancel: () => new Promise<void>((_resolve, reject) => { rejectStop = reject; }),
+    });
+    const manager = new JobManager({ runner });
+    const root = mkdtempSync(join(tmpdir(), "context-mode-job-cancel-race-"));
+    try {
+      const started = manager.start({ command: "work", cwd: root });
+      const cancelling = expect(manager.cancel(started.jobId)).rejects.toThrow("stop failed");
+      runner.completions[0]({ exitCode: 1, stdoutTail: "", stderrTail: "error" });
+      rejectStop(new Error("stop failed"));
+      await cancelling;
+      await started.done;
+      expect(manager.status(started.jobId).status).toBe("failed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("classifies systemd termination reasons without losing cancellation precedence", async () => {
     const cases = [
       [{ exitCode: 1, systemdResult: "oom-kill", execMainStatus: 9 }, "oom-kill"],
