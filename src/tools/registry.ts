@@ -12,13 +12,12 @@ export type RegisterTool = (
   handler: (toolArgs: any, ctx?: { signal?: AbortSignal }) => Promise<any> | any,
 ) => unknown;
 
+// Only execution and purge require a project-wide queue. Store reads/writes
+// are synchronous SQLite operations; async URL fetching must not hold this lock.
 const SERIALIZED_PROJECT_TOOLS = new Set([
   "ctx_execute",
   "ctx_job_start",
   "ctx_execute_file",
-  "ctx_index",
-  "ctx_search",
-  "ctx_fetch_and_index",
   "ctx_batch_execute",
   "ctx_purge",
 ]);
@@ -73,19 +72,21 @@ export function createToolRegistry(isAsyncJobActive: (projectDir: string) => boo
   }
 
   const register: RegisterTool = (name, config, handler) => {
-    const guardedHandler = SERIALIZED_PROJECT_TOOLS.has(name)
-      ? (toolArgs: any, ctx?: { signal?: AbortSignal }) => {
-          const requestedCwd = typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined;
-          const executionDir = resolveExecutionProjectDir(requestedCwd);
-          const normalizedArgs = requestedCwd === undefined ? toolArgs : { ...toolArgs, cwd: executionDir };
-          return withProjectToolLock(executionDir, ctx?.signal, (projectScope) => {
-            if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive(projectScope)) {
-              return { isError: true, content: [{ type: "text", text: "busy: async job is running for this project; foreground execution is temporarily disabled" }] };
-            }
-            return handler(normalizedArgs, ctx);
-          });
+    const guardedHandler = (toolArgs: any, ctx?: { signal?: AbortSignal }) => {
+      const requestedCwd = typeof toolArgs?.cwd === "string" ? toolArgs.cwd : undefined;
+      const executionDir = resolveExecutionProjectDir(requestedCwd);
+      const normalizedArgs = requestedCwd === undefined ? toolArgs : { ...toolArgs, cwd: executionDir };
+      const invoke = (projectScope: string) => {
+        if (FOREGROUND_EXECUTION_TOOLS.has(name) && isAsyncJobActive(projectScope)) {
+          return { isError: true, content: [{ type: "text", text: "busy: async job is running for this project; foreground execution is temporarily disabled" }] };
         }
-      : handler;
+        return handler(normalizedArgs, ctx);
+      };
+      if (SERIALIZED_PROJECT_TOOLS.has(name)) return withProjectToolLock(executionDir, ctx?.signal, invoke);
+      // Preserve async-local cwd without waiting for unrelated commands or fetches.
+      if (ctx?.signal?.aborted) throw abortReason(ctx.signal);
+      return runWithProjectDir(executionDir, () => invoke(resolveProjectScope(executionDir)));
+    };
     tools.push({ name, config, handler: guardedHandler });
     return guardedHandler;
   };

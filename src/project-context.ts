@@ -10,6 +10,17 @@ type ToolContextOverride = { projectDir: string };
 
 const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
 const stores = new Map<string, ContentStore>();
+// Fence in-flight fetches so an explicit purge cannot be undone by late results.
+const projectGenerations = new Map<string, number>();
+
+export function getProjectGeneration(projectDir: string = getProjectDir()): number {
+  return projectGenerations.get(resolveProjectScope(projectDir)) ?? 0;
+}
+
+export function advanceProjectGeneration(projectDir: string = getProjectDir()): void {
+  const scope = resolveProjectScope(projectDir);
+  projectGenerations.set(scope, (projectGenerations.get(scope) ?? 0) + 1);
+}
 const DEFAULT_CONTENT_DIR = join(homedir(), ".claude", "context-mode", "content");
 const DEFAULT_MAX_OPEN_STORES = 8;
 

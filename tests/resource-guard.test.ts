@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import * as fetchLib from "../src/fetch.js";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import { BATCH_COMMAND_CAPTURE_BYTES, runBatchCommands } from "../src/batch.js";
 import { runPool } from "../src/runPool.js";
 import { ContentStore } from "../src/store.js";
 import { createToolRegistry } from "../src/tools/registry.js";
+import { getProjectDir } from "../src/project-context.js";
 
 describe("resource guards", () => {
   test("cancels the spawned process tree when the request aborts", async () => {
@@ -452,6 +454,77 @@ describe("resource guards", () => {
     } finally {
       releaseFirst();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not queue search or indexing behind a long same-project execution", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-nonblocking-read-"));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const registry = createToolRegistry(() => false);
+    const execute = registry.register("ctx_execute", {}, async () => { await gate; return "executed"; }) as (args: { cwd: string }) => Promise<unknown>;
+    const search = registry.register("ctx_search", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
+    const index = registry.register("ctx_index", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
+    try {
+      const pending = execute({ cwd: root });
+      const reads = Promise.all([search({ cwd: root }), index({ cwd: root })]);
+      await expect(Promise.race([reads, new Promise((resolve) => setTimeout(() => resolve("blocked"), 50))])).resolves.toEqual([root, root]);
+      release();
+      await pending;
+    } finally {
+      release();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not queue execution behind a same-project network fetch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-nonblocking-fetch-"));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const registry = createToolRegistry(() => false);
+    const fetch = registry.register("ctx_fetch_and_index", {}, async () => { await gate; return "fetched"; }) as (args: { cwd: string }) => Promise<unknown>;
+    const execute = registry.register("ctx_execute", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
+    try {
+      const pending = fetch({ cwd: root });
+      await expect(Promise.race([execute({ cwd: root }), new Promise((resolve) => setTimeout(() => resolve("blocked"), 50))])).resolves.toBe(root);
+      release();
+      await pending;
+    } finally {
+      release();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discards a late fetch result after a project purge", async () => {
+    const root = mkdtempSync(join(tmpdir(), "context-mode-fetch-purge-"));
+    const storage = mkdtempSync(join(tmpdir(), "context-mode-fetch-purge-store-"));
+    const previousStorage = process.env.CONTEXT_MODE_DIR;
+    process.env.CONTEXT_MODE_DIR = storage;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const spy = vi.spyOn(fetchLib, "fetchOneUrl").mockImplementation(async () => {
+      await gate;
+      return { kind: "fetched", url: "https://example.com", markdown: "late_purge_marker_1936", header: "text/plain" };
+    });
+    const fetch = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_fetch_and_index")!;
+    const purge = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_purge")!;
+    const search = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_search")!;
+    try {
+      const pending = fetch.handler({ requests: [{ url: "https://example.com" }], cwd: root });
+      await purge.handler({ confirm: true, cwd: root });
+      release();
+      const result = await pending as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("purged");
+      const indexed = await search.handler({ queries: ["late_purge_marker_1936"], cwd: root }) as { content: Array<{ text: string }> };
+      expect(indexed.content[0].text).toContain("empty");
+    } finally {
+      release();
+      spy.mockRestore();
+      if (previousStorage === undefined) delete process.env.CONTEXT_MODE_DIR;
+      else process.env.CONTEXT_MODE_DIR = previousStorage;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(storage, { recursive: true, force: true });
     }
   });
 

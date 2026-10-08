@@ -3,6 +3,7 @@ import { z } from "zod";
 import { executor } from "../app-runtime.js";
 import { resolveConfiguredConcurrency } from "../batch.js";
 import { fetchOneUrl, indexFetched, type FetchOneResult, type IndexedFetchResult } from "../fetch.js";
+import { getProjectGeneration } from "../project-context.js";
 import { runPool, type PoolJob } from "../runPool.js";
 import type { RegisterTool } from "./registry.js";
 
@@ -52,6 +53,7 @@ export function registerFetchTools(registerCtxTool: RegisterTool): void {
       }),
     },
     async ({ requests, concurrency, force, ttl }, ctx) => {
+      const generation = getProjectGeneration();
       const batch: { url: string; source?: string }[] = requests;
       const requestedConcurrency = concurrency ?? 1;
       const configuredConcurrency = resolveConfiguredConcurrency(requestedConcurrency);
@@ -67,6 +69,9 @@ export function registerFetchTools(registerCtxTool: RegisterTool): void {
         capByCpuCount: requestedConcurrency > 1,
       });
       const { settled, effectiveConcurrency } = pool;
+      if (generation !== getProjectGeneration()) {
+        return { isError: true, content: [{ type: "text" as const, text: "Fetch results discarded: project index was purged during the request." }] };
+      }
       const capped = configuredCapped || pool.capped;
 
       // Serial index drain — workers race on fetch, but store.index* runs one at a time.

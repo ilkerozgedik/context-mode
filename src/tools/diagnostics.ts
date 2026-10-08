@@ -5,7 +5,7 @@ import { available, jobManager, runtimes } from "../app-runtime.js";
 import { getBatchConcurrencyLimit } from "../batch.js";
 import { loadDatabase } from "../db-base.js";
 import { PolyglotExecutor, configuredExecutionAdmissionError } from "../executor.js";
-import { closeProjectStore, getContentDir, getProjectDir, projectHash } from "../project-context.js";
+import { advanceProjectGeneration, closeProjectStore, getContentDir, getProjectDir, projectHash } from "../project-context.js";
 import type { RegisterTool } from "./registry.js";
 
 export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: string): void {
@@ -94,6 +94,7 @@ export function registerDiagnosticTools(registerCtxTool: RegisterTool, version: 
         return { content: [{ type: "text" as const, text: "Purge cancelled. Pass confirm: true to proceed." }] };
       }
 
+      advanceProjectGeneration();
       closeProjectStore();
 
       try {
