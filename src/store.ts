@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, quarantineDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, unlinkSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -457,7 +457,7 @@ export class ContentStore {
   /**
    * Check all file-backed sources for staleness and auto re-index changed files.
    * Uses mtime as a fast gate — only computes SHA-256 when mtime has advanced
-   * past indexed_at. Gracefully skips deleted files and non-file sources.
+   * past indexed_at. Removes missing file-backed sources, but retains non-file sources.
    */
   #refreshStaleSources(): void {
     if (this.#refreshCheckedThisTurn) return;
@@ -479,8 +479,18 @@ export class ContentStore {
           this.#searchEngine.clearFuzzyCache();
           continue;
         }
-        if (!existsSync(src.file_path)) continue; // deleted but still allowed — keep cached results
-        const mtime = statSync(src.file_path).mtime;
+        let mtime: Date;
+        try {
+          mtime = statSync(src.file_path).mtime;
+        } catch (error) {
+          // Only a confirmed missing path is stale; retain cached data on EACCES/EIO.
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR") {
+            this.#db.transaction(() => this.#deleteSourceRows(src.label))();
+            this.#searchEngine.clearFuzzyCache();
+          }
+          continue;
+        }
         const indexedAt = new Date(src.indexed_at + "Z");
         if (mtime <= indexedAt) continue; // file unchanged — fast path
 

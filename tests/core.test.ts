@@ -156,6 +156,49 @@ describe("persistent core", () => {
 
 
 describe("file-backed store refresh", () => {
+  test("removes deleted file-backed chunks but retains inline content", async () => {
+    const dir = tempDir();
+    const filePath = join(dir, "gone.md");
+    writeFileSync(filePath, "deleted_source_marker_7254");
+    const store = new ContentStore(join(dir, "deleted-file.db"));
+    try {
+      store.index({ path: filePath, source: "gone-file" });
+      store.index({ content: "inline_source_marker_7254", source: "inline-note" });
+      expect(store.searchWithFallback("deleted_source_marker_7254", 3)).toHaveLength(1);
+      await Promise.resolve();
+      rmSync(filePath);
+      expect(store.searchWithFallback("deleted_source_marker_7254", 3)).toHaveLength(0);
+      expect(store.getSourceMeta("gone-file")).toBeNull();
+      expect(store.searchWithFallback("inline_source_marker_7254", 3)).toHaveLength(1);
+      writeFileSync(filePath, "recreated_source_marker_7254");
+      store.index({ path: filePath, source: "gone-file" });
+      await Promise.resolve();
+      expect(store.searchWithFallback("recreated_source_marker_7254", 3)).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("prunes sources when an indexed parent directory becomes a file", async () => {
+    const dir = tempDir();
+    const parent = join(dir, "src");
+    mkdirSync(parent);
+    const path = join(parent, "gone.md");
+    writeFileSync(path, "enotdir_source_marker_5729");
+    const store = new ContentStore(join(dir, "parent-replaced.db"));
+    try {
+      store.index({ path, source: "replaced-parent" });
+      expect(store.searchWithFallback("enotdir_source_marker_5729", 3)).toHaveLength(1);
+      await Promise.resolve();
+      rmSync(parent, { recursive: true, force: true });
+      writeFileSync(parent, "now-a-file");
+      expect(store.searchWithFallback("enotdir_source_marker_5729", 3)).toHaveLength(0);
+      expect(store.getSourceMeta("replaced-parent")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
   test("removes previously indexed content when the Read deny policy changes", async () => {
     const dir = tempDir();
     const filePath = join(dir, "secret.txt");
