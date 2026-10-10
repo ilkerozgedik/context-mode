@@ -1,7 +1,6 @@
 import { z } from "zod";
-import { executor, jobManager } from "../app-runtime.js";
+import { executor } from "../app-runtime.js";
 import { buildExecuteEcho } from "../batch.js";
-import { configuredExecutionAdmissionError, configuredJobAdmissionError } from "../executor.js";
 import { classifyNonZeroExit } from "../exit-classify.js";
 import { resolveExecutionProjectDir } from "../project-context.js";
 import {
@@ -146,69 +145,6 @@ ${code}
           ],
           isError: true,
         };
-      }
-    },
-  );
-
-  // ─────────────────────────────────────────────────────────
-
-  // Tool: async job execution for long-running builds
-  registerCtxTool(
-    "ctx_job_start",
-    {
-      title: "Start resource-limited async job (uses MCP server OS permissions)",
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-      description: "Run a long shell job with MCP server OS permissions; returns a receipt.",
-      inputSchema: z.object({
-        command: z.string().min(1).describe("Shell command to run."),
-        cwd: z.string().optional().describe("Working directory."),
-        expected_artifacts: z.array(z.string().min(1)).max(16).optional().describe("Artifact paths under cwd."),
-      }),
-    },
-    async ({ command, cwd, expected_artifacts }) => {
-      try {
-        const admissionError = configuredExecutionAdmissionError() ?? configuredJobAdmissionError();
-        if (admissionError) throw new Error(admissionError);
-        const projectDir = resolveExecutionProjectDir(cwd);
-        const started = jobManager.start({ command, cwd: projectDir, expectedArtifacts: expected_artifacts });
-        return { content: [{ type: "text", text: JSON.stringify(jobManager.status(started.jobId)) }] };
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
-      }
-    },
-  );
-
-  registerCtxTool(
-    "ctx_job_status",
-    {
-      title: "Read async job status",
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      description: "Read async job receipt.",
-      inputSchema: z.object({ job_id: z.string().min(1) }),
-    },
-    async ({ job_id }) => {
-      try {
-        return { content: [{ type: "text", text: JSON.stringify(jobManager.status(job_id)) }] };
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
-      }
-    },
-  );
-
-  registerCtxTool(
-    "ctx_job_cancel",
-    {
-      title: "Cancel async job",
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      description: "Cancel async job; return final receipt.",
-      inputSchema: z.object({ job_id: z.string().min(1) }),
-    },
-    async ({ job_id }) => {
-      try {
-        const receipt = await jobManager.cancel(job_id);
-        return { content: [{ type: "text", text: JSON.stringify(receipt) }] };
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
       }
     },
   );

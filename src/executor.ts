@@ -24,14 +24,6 @@ export function memoryAdmissionError(meminfo: string, minAvailableMb: number): s
     : undefined;
 }
 
-export function resolveForegroundTimeout(
-  timeout: number | undefined,
-  maxForegroundMs: number,
-): number | undefined {
-  if (maxForegroundMs <= 0) return timeout;
-  return timeout === undefined ? maxForegroundMs : Math.min(timeout, maxForegroundMs);
-}
-
 function configuredMemoryAdmissionError(envName: string): string | undefined {
   const minimum = readPositiveEnv(envName, 0);
   if (minimum <= 0 || process.platform !== "linux") return undefined;
@@ -44,10 +36,6 @@ function configuredMemoryAdmissionError(envName: string): string | undefined {
 
 export function configuredExecutionAdmissionError(): string | undefined {
   return configuredMemoryAdmissionError("CONTEXT_MODE_MIN_AVAILABLE_MB");
-}
-
-export function configuredJobAdmissionError(): string | undefined {
-  return configuredMemoryAdmissionError("CONTEXT_MODE_JOB_MIN_AVAILABLE_MB");
 }
 
 /**
@@ -293,7 +281,6 @@ export class PolyglotExecutor {
     const { language, code, timeout, cwd: cwdOverride, signal, captureLimitBytes } = opts;
     const admissionError = configuredExecutionAdmissionError();
     if (admissionError) throw new Error(admissionError);
-    const effectiveTimeout = resolveForegroundTimeout(timeout, readPositiveEnv("CONTEXT_MODE_MAX_FOREGROUND_MS", 0));
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -312,7 +299,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, effectiveTimeout, signal, captureLimitBytes);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, signal, captureLimitBytes);
       cleanupTmpDir(tmpDir);
       return result;
     } catch (err) {

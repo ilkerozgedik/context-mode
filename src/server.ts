@@ -15,7 +15,7 @@ import { registerIndexingTools } from "./tools/indexing.js";
 import { registerFetchTools } from "./tools/fetch.js";
 import { registerBatchTools } from "./tools/batch-execute.js";
 import { registerDiagnosticTools } from "./tools/diagnostics.js";
-import { executor, jobManager, runtimes } from "./app-runtime.js";
+import { executor, runtimes } from "./app-runtime.js";
 import { closeStore } from "./project-context.js";
 export { withProjectDirOverride } from "./project-context.js";
 export { isDirectExecution } from "./cli.js";
@@ -47,7 +47,7 @@ process.on("uncaughtException", (err) => {
 });
 
 
-const toolRegistry = createToolRegistry((projectDir) => jobManager.isActive(projectDir));
+const toolRegistry = createToolRegistry();
 export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = toolRegistry.tools;
 const registerCtxTool = toolRegistry.register;
 registerExecutionTools(registerCtxTool);
@@ -85,7 +85,6 @@ export function createContextModeNodeHttpServer(
 }
 
 function cleanupRuntime(): void {
-  jobManager.cleanup();
   executor.cleanupProcesses();
   closeStore();
 }

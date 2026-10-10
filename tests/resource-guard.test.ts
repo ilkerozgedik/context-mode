@@ -5,9 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PolyglotExecutor,
-  configuredJobAdmissionError,
   memoryAdmissionError,
-  resolveForegroundTimeout,
 } from "../src/executor.js";
 import { getBatchConcurrencyLimit, resolveConfiguredConcurrency, REGISTERED_CTX_TOOLS } from "../src/server.js";
 import { BATCH_COMMAND_CAPTURE_BYTES, runBatchCommands } from "../src/batch.js";
@@ -146,54 +144,11 @@ describe("resource guards", () => {
     }
   });
 
-  test("does not execute an aborted request after it waits for the project lock", async () => {
-    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
-    expect(execute).toBeDefined();
-    const marker = join(tmpdir(), `context-mode-queued-abort-${process.pid}-${Date.now()}`);
-    const controller = new AbortController();
-    try {
-      const first = execute!.handler({
-        language: "javascript",
-        code: "await new Promise((resolve) => setTimeout(resolve, 200)); console.log('first done')",
-        timeout: 1000,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      const queued = execute!.handler({
-        language: "javascript",
-        code: `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
-        timeout: 1000,
-      }, { signal: controller.signal });
-      controller.abort(new Error("request cancelled"));
-      await expect(queued).rejects.toThrow("request cancelled");
-      await first;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(existsSync(marker)).toBe(false);
-    } finally {
-      rmSync(marker, { force: true });
-    }
-  });
-
-  test("uses a separate memory admission threshold for heavy jobs", () => {
-    const previous = process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB;
-    process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB = "999999999";
-    try {
-      if (process.platform === "linux") {
-        expect(configuredJobAdmissionError()).toContain("requires 999999999 MiB");
-      }
-    } finally {
-      if (previous === undefined) delete process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB;
-      else process.env.CONTEXT_MODE_JOB_MIN_AVAILABLE_MB = previous;
-    }
-  });
-
-  test("applies deployment memory and foreground timeout limits", () => {
+  test("applies deployment memory and batch concurrency limits", () => {
     expect(memoryAdmissionError("MemTotal: 1024 kB\nMemAvailable: 524288 kB\n", 768))
       .toContain("512 MiB available");
     expect(memoryAdmissionError("MemAvailable: 1048576 kB\n", 768)).toBeUndefined();
     expect(memoryAdmissionError("MemAvailable: 1 kB\n", 0)).toBeUndefined();
-    expect(resolveForegroundTimeout(undefined, 45_000)).toBe(45_000);
-    expect(resolveForegroundTimeout(90_000, 45_000)).toBe(45_000);
-    expect(resolveForegroundTimeout(10_000, 45_000)).toBe(10_000);
     const previousConcurrency = process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY;
     try {
       process.env.CONTEXT_MODE_MAX_BATCH_CONCURRENCY = "2";
@@ -408,7 +363,7 @@ describe("resource guards", () => {
     let arrivals = 0;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const registry = createToolRegistry(() => false);
+    const registry = createToolRegistry();
     const run = registry.register("ctx_execute", {}, async () => {
       arrivals += 1;
       if (arrivals === 2) release();
@@ -428,7 +383,7 @@ describe("resource guards", () => {
     }
   });
 
-  test("serializes calls within the same project scope", async () => {
+  test("runs calls within the same project scope concurrently", async () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-concurrent-same-"));
     const child = join(root, "packages", "app");
     mkdirSync(join(root, ".git"));
@@ -436,7 +391,7 @@ describe("resource guards", () => {
     let entries = 0;
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const registry = createToolRegistry(() => false);
+    const registry = createToolRegistry();
     const run = registry.register("ctx_execute", {}, async () => {
       entries += 1;
       if (entries === 1) await firstGate;
@@ -447,7 +402,7 @@ describe("resource guards", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       const second = run({ cwd: child });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(entries).toBe(1);
+      expect(entries).toBe(2);
       releaseFirst();
       await Promise.all([first, second]);
       expect(entries).toBe(2);
@@ -461,7 +416,7 @@ describe("resource guards", () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-nonblocking-read-"));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const registry = createToolRegistry(() => false);
+    const registry = createToolRegistry();
     const execute = registry.register("ctx_execute", {}, async () => { await gate; return "executed"; }) as (args: { cwd: string }) => Promise<unknown>;
     const search = registry.register("ctx_search", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
     const index = registry.register("ctx_index", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
@@ -481,7 +436,7 @@ describe("resource guards", () => {
     const root = mkdtempSync(join(tmpdir(), "context-mode-nonblocking-fetch-"));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const registry = createToolRegistry(() => false);
+    const registry = createToolRegistry();
     const fetch = registry.register("ctx_fetch_and_index", {}, async () => { await gate; return "fetched"; }) as (args: { cwd: string }) => Promise<unknown>;
     const execute = registry.register("ctx_execute", {}, () => getProjectDir()) as (args: { cwd: string }) => Promise<string>;
     try {

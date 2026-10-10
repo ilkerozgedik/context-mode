@@ -4,14 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REGISTERED_CTX_TOOLS, isDirectExecution, withProjectDirOverride } from "../src/server.js";
-import { resolveExecutionProjectDir, resolveProjectScope } from "../src/project-context.js";
+import { resolveExecutionProjectDir } from "../src/project-context.js";
 import { createToolRegistry } from "../src/tools/registry.js";
 
 const EXPECTED_TOOLS = [
   "ctx_execute",
-  "ctx_job_start",
-  "ctx_job_status",
-  "ctx_job_cancel",
   "ctx_execute_file",
   "ctx_index",
   "ctx_search",
@@ -105,25 +102,10 @@ describe("context-mode tool surface", () => {
   });
 
   test("execution tools disclose that code uses the MCP server OS permissions", () => {
-    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_job_start"]) {
+    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute"]) {
       const tool = REGISTERED_CTX_TOOLS.find((candidate) => candidate.name === name);
       expect(tool?.config.description).toContain("OS permissions");
     }
-  });
-
-  test("async job tools advertise correct MCP safety annotations", () => {
-    const start = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_start");
-    const status = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_status");
-    const cancel = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_job_cancel");
-    expect(start?.config.annotations).toEqual(expect.objectContaining({
-      readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
-    }));
-    expect(status?.config.annotations).toEqual(expect.objectContaining({
-      readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
-    }));
-    expect(cancel?.config.annotations).toEqual(expect.objectContaining({
-      readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false,
-    }));
   });
 
   test("ctx_execute rejects the removed background compatibility argument", () => {
@@ -219,11 +201,11 @@ describe("context-mode tool surface", () => {
     expect(schema.safeParse({}).success).toBe(false);
   });
 
-  test("resolves relative cwd once while locking by canonical project scope", async () => {
+  test("resolves relative cwd within project context", async () => {
     const base = mkdtempSync(join(tmpdir(), "context-mode-relative-base-"));
     const repo = join(base, "work", "repo");
     mkdirSync(join(repo, ".git"), { recursive: true });
-    const registry = createToolRegistry(() => false);
+    const registry = createToolRegistry();
     const execute = registry.register("ctx_execute", {}, async (args: { cwd: string }) => ({
       content: [{ type: "text", text: JSON.stringify({ cwd: args.cwd, resolved: resolveExecutionProjectDir(args.cwd) }) }],
     })) as (args: { cwd: string }) => Promise<{ content: Array<{ text: string }> }>;
@@ -239,28 +221,6 @@ describe("context-mode tool surface", () => {
     }
   });
 
-  test("foreground execution is blocked only for the project with an active async job", async () => {
-    const rootA = mkdtempSync(join(tmpdir(), "context-mode-active-a-"));
-    const rootB = mkdtempSync(join(tmpdir(), "context-mode-active-b-"));
-    const activeScope = resolveProjectScope(rootA);
-    const registry = createToolRegistry((projectDir) => projectDir === activeScope);
-    const execute = registry.register("ctx_execute", {}, async () => ({
-      content: [{ type: "text", text: "other-project-ok" }],
-    })) as (args: { cwd: string }) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
-    try {
-      const blocked = await execute({ cwd: rootA });
-      expect(blocked.isError).toBe(true);
-      expect(blocked.content[0].text).toMatch(/this project/i);
-
-      const allowed = await execute({ cwd: rootB });
-      expect(allowed.isError).not.toBe(true);
-      expect(allowed.content[0].text).toContain("other-project-ok");
-    } finally {
-      rmSync(rootA, { recursive: true, force: true });
-      rmSync(rootB, { recursive: true, force: true });
-    }
-  });
-
   test("doctor validates the standalone runtime", async () => {
     const doctor = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_doctor");
     expect(doctor).toBeDefined();
@@ -269,7 +229,5 @@ describe("context-mode tool surface", () => {
     expect(text).toContain("context-mode doctor");
     expect(text).toContain("[OK] Executor: PASS");
     expect(text).toContain("[OK] FTS5 / SQLite: PASS");
-    expect(text).toContain("job concurrency 2 global / 1 project");
-    expect(text).toContain("[OK] Async jobs: 0/2 active");
   });
 });
